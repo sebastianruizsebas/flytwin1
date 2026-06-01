@@ -17,8 +17,22 @@ Online interface (Phase 2c):
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.optimize import minimize
+
+from .design_matrix import MAX_STIM_LAG_MS, N_COLS, build_design_row
+
+
+@dataclass(frozen=True)
+class OdorPosterior:
+    """Posterior summary over odor-related Level 2 state inferred from spikes."""
+
+    mean: np.ndarray
+    sigma: np.ndarray
+    log_evidence: float
+    map_log_likelihood: float
 
 
 def sigmoid(x: np.ndarray) -> np.ndarray:
@@ -33,6 +47,122 @@ def log_likelihood(X: np.ndarray, y: np.ndarray, beta: np.ndarray) -> float:
     p = sigmoid(X @ beta)
     p = np.clip(p, 1e-9, 1 - 1e-9)
     return float(np.sum(y * np.log(p) + (1 - y) * np.log(1 - p)))
+
+
+def _gaussian_log_prior(value: np.ndarray, mean: np.ndarray, sigma: np.ndarray) -> float:
+    sigma = np.maximum(sigma, 1e-3)
+    z = (value - mean) / sigma
+    return float(-0.5 * np.sum(z ** 2 + np.log(2.0 * np.pi * sigma ** 2)))
+
+
+def _logsumexp(values: np.ndarray) -> float:
+    max_value = float(np.max(values))
+    return max_value + float(np.log(np.sum(np.exp(values - max_value))))
+
+
+def _candidate_design_rows(
+    spike_history_window: np.ndarray,
+    heading_window: np.ndarray,
+    wind_angle_window: np.ndarray,
+    c_left: float,
+    c_right: float,
+) -> np.ndarray:
+    drive = 1.5 * (c_left + c_right)
+    u_hist = np.full(MAX_STIM_LAG_MS, drive, dtype=float)
+    rows = np.empty((len(heading_window), N_COLS), dtype=float)
+
+    for t in range(len(heading_window)):
+        rows[t] = build_design_row(
+            u_sens_history=u_hist,
+            spike_history=spike_history_window[t],
+            heading=float(heading_window[t]),
+            c_left=c_left,
+            c_right=c_right,
+            wind_angle=float(wind_angle_window[t]),
+        )
+    return rows
+
+
+def infer_odor_posterior(
+    spike_window: np.ndarray,
+    beta: np.ndarray,
+    spike_history_window: np.ndarray,
+    heading_window: np.ndarray,
+    wind_angle_window: np.ndarray,
+    prior_mean: np.ndarray,
+    prior_sigma: np.ndarray,
+    grid_size: int = 13,
+) -> OdorPosterior:
+    """
+    Infer a posterior over [c_left, c_right, delta_c] from the recent spike window.
+
+    The bridge uses a grid approximation over a low-dimensional odor latent state.
+    Candidate odor causes are converted into PP-GLM design rows, scored by the
+    Bernoulli spike likelihood, then combined with the Level 2 Gaussian prior.
+    """
+    if spike_window.size == 0:
+        mean = prior_mean.astype(float).copy()
+        sigma = np.maximum(prior_sigma.astype(float), 1e-3)
+        return OdorPosterior(
+            mean=mean,
+            sigma=sigma,
+            log_evidence=0.0,
+            map_log_likelihood=0.0,
+        )
+
+    prior_mean = prior_mean.astype(float)
+    prior_sigma = np.maximum(prior_sigma.astype(float), 1e-3)
+
+    c_mean_prior = max(0.0, 0.5 * (prior_mean[0] + prior_mean[1]))
+    c_mean_sigma = max(0.1, 0.5 * (prior_sigma[0] + prior_sigma[1]))
+    delta_prior = float(prior_mean[2])
+    delta_sigma = max(0.1, float(prior_sigma[2]))
+
+    c_max = max(1.5, c_mean_prior + 3.0 * c_mean_sigma)
+    delta_span = max(0.6, abs(delta_prior) + 3.0 * delta_sigma)
+
+    c_mean_grid = np.linspace(0.0, c_max, grid_size)
+    delta_grid = np.linspace(-delta_span, delta_span, grid_size)
+
+    posterior_states = []
+    log_posts = []
+    map_log_likelihood = -np.inf
+
+    spike_window = spike_window.astype(float)
+    for c_mean in c_mean_grid:
+        for delta_c in delta_grid:
+            c_left = max(0.0, c_mean + 0.5 * delta_c)
+            c_right = max(0.0, c_mean - 0.5 * delta_c)
+            state = np.array([c_left, c_right, c_left - c_right], dtype=float)
+            X = _candidate_design_rows(
+                spike_history_window=spike_history_window,
+                heading_window=heading_window,
+                wind_angle_window=wind_angle_window,
+                c_left=c_left,
+                c_right=c_right,
+            )
+            candidate_log_lik = log_likelihood(X, spike_window, beta)
+            candidate_log_post = candidate_log_lik + _gaussian_log_prior(state, prior_mean, prior_sigma)
+
+            posterior_states.append(state)
+            log_posts.append(candidate_log_post)
+            map_log_likelihood = max(map_log_likelihood, candidate_log_lik)
+
+    states = np.vstack(posterior_states)
+    log_posts_arr = np.array(log_posts, dtype=float)
+    log_norm = _logsumexp(log_posts_arr)
+    weights = np.exp(log_posts_arr - log_norm)
+
+    mean = np.sum(states * weights[:, None], axis=0)
+    var = np.sum(weights[:, None] * (states - mean) ** 2, axis=0)
+    sigma = np.sqrt(np.maximum(var, 1e-4))
+
+    return OdorPosterior(
+        mean=mean,
+        sigma=sigma,
+        log_evidence=log_norm,
+        map_log_likelihood=float(map_log_likelihood),
+    )
 
 
 def _smooth_l1(z: np.ndarray, eps: float = 1e-4) -> float:

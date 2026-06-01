@@ -6,7 +6,7 @@ Execution order per iteration (Phase 4b):
   1. Advance OdorPlume state (1 ms).
   2. Read bilateral antennal odor sensors; compute u_sens.
   3. Inject u_sens into HH neuron(s); advance 1 ms; collect spikes.
-  4. Every 10 ms: evaluate PP-GLM on spike buffer; get log-likelihood.
+    4. Every 10 ms: infer a spike-conditioned odor posterior with the PP-GLM bridge.
   5. Every 20 ms: update Level 2 Gaussian belief and Level 3 mode probabilities.
   6. Evaluate EFE for SURGE, CAST, AVOID, STOP; select mode.
   7. Map mode to walking motor command; apply (or log for flybody).
@@ -29,10 +29,10 @@ import numpy as np
 
 from environment_sim.odor_plume import OdorPlume
 from level1_biophysics.hh_neuron import HHNeuron
-from level2_bridge.design_matrix import build_design_row, MAX_STIM_LAG_MS, MAX_HIST_LAG_MS
-from level2_bridge.ppglm import evaluate_online
+from level2_bridge.design_matrix import MAX_HIST_LAG_MS
+from level2_bridge.ppglm import OdorPosterior, infer_odor_posterior
 from level3_controller.active_inference import (
-    ActiveInferenceController, IDX_THETA, IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C,
+    ActiveInferenceController, IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C,
 )
 from level3_controller.policy import select_action, mode_to_motor_command
 
@@ -135,17 +135,19 @@ def run(
         "c_left": 0.0, "c_right": 0.0,
     }
 
-    # Running histories for design matrix construction
-    u_hist: List[float] = [0.0] * MAX_STIM_LAG_MS
+    # Running histories for the spike bridge construction
     s_hist: List[int]   = [0]   * MAX_HIST_LAG_MS
     spike_buffer_window: List[float] = []  # accumulates over DT_GLM_MS window
-    x_buffer_window: List[np.ndarray] = []  # design rows for the same window
+    heading_buffer_window: List[float] = []
+    wind_angle_buffer_window: List[float] = []
+    spike_history_buffer_window: List[np.ndarray] = []
 
     # Counters and bookkeeping
     t_ms        = 0.0
     glm_counter = 0.0
     ctrl_counter = 0.0
     last_log_lik = 0.0
+    last_spike_posterior: OdorPosterior | None = None
     last_mode    = None
     last_cmd: dict = {"forward_speed": 0.0, "yaw_rate": 0.0, "sidestep": 0.0, "active": True}
 
@@ -193,23 +195,16 @@ def run(
         # ── 3. Inject into HH neuron, collect spike ───────────────────────
         spiked = neuron.step(current_uA=u_val, dt_ms=DT_MS)
 
-        # Build design row for this time step
-        x_row = build_design_row(
-            u_sens_history=np.array(u_hist),
-            spike_history=np.array(s_hist, dtype=float),
-            heading=theta,
-            c_left=c_left,
-            c_right=c_right,
-            wind_angle=wind_angle,
-        )
+        spike_history_snapshot = np.array(s_hist, dtype=float)
 
         # Update rolling histories
-        u_hist.pop(0); u_hist.append(u_val)
         s_hist.pop(0); s_hist.append(int(spiked))
 
-        # Accumulate spike buffer and design rows for GLM window
+        # Accumulate spike buffer and observed context for the PP-GLM bridge
         spike_buffer_window.append(float(spiked))
-        x_buffer_window.append(x_row)
+        heading_buffer_window.append(theta)
+        wind_angle_buffer_window.append(wind_angle)
+        spike_history_buffer_window.append(spike_history_snapshot)
 
         # Update body state with updated odor
         body_state["c_left"]  = c_left
@@ -220,25 +215,33 @@ def run(
         glm_counter  += DT_MS
         ctrl_counter += DT_MS
 
-        # ── 4. PP-GLM evaluation every 10 ms ─────────────────────────────
+        # ── 4. Spike-to-odor bridge every 10 ms ──────────────────────────
         if glm_counter >= DT_GLM_MS:
             glm_counter = 0.0
             if len(spike_buffer_window) > 0:
                 spk_arr = np.array(spike_buffer_window)
-                x_arr   = np.vstack(x_buffer_window)
-                last_log_lik = evaluate_online(spk_arr, beta, x_arr)
+                last_spike_posterior = infer_odor_posterior(
+                    spike_window=spk_arr,
+                    beta=beta,
+                    spike_history_window=np.stack(spike_history_buffer_window),
+                    heading_window=np.array(heading_buffer_window, dtype=float),
+                    wind_angle_window=np.array(wind_angle_buffer_window, dtype=float),
+                    prior_mean=controller.body_state.mu[[IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C]],
+                    prior_sigma=controller.body_state.sigma[[IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C]],
+                )
+                last_log_lik = last_spike_posterior.log_evidence
             spike_buffer_window.clear()
-            x_buffer_window.clear()
+            heading_buffer_window.clear()
+            wind_angle_buffer_window.clear()
+            spike_history_buffer_window.clear()
 
         # ── 5–7. Belief update + EFE + motor command every 20 ms ─────────
         if ctrl_counter >= DT_CTRL_MS:
             ctrl_counter = 0.0
 
-            odor_obs = np.array([c_left, c_right, c_left - c_right])
             controller.update_beliefs(
                 mujoco_obs=body_state,
-                ppglm_log_lik=last_log_lik,
-                odor_obs=odor_obs,
+                spike_posterior=last_spike_posterior,
             )
 
             mode = select_action(controller)
@@ -253,7 +256,10 @@ def run(
             log_log_liks.append(last_log_lik)
 
             # Check stop condition
-            if body_state["d_food"] < 0.02 and 0.5 * (c_left + c_right) > 0.3:
+            inferred_c_avg = 0.5 * (
+                controller.body_state.c_left + controller.body_state.c_right
+            )
+            if body_state["d_food"] < 0.02 and inferred_c_avg > 0.3:
                 if verbose:
                     print(f"  ** Food reached at t={t_ms:.0f} ms, d_food={body_state['d_food']:.3f} m")
                 break
