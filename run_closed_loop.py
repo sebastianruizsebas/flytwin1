@@ -31,6 +31,7 @@ from environment_sim.odor_plume import OdorPlume
 from level1_biophysics.hh_neuron import HHNeuron
 from level2_bridge.design_matrix import MAX_HIST_LAG_MS
 from level2_bridge.ppglm import OdorPosterior, infer_odor_posterior
+from level2_bridge.motor_readout import MotorReadout
 from level3_controller.active_inference import (
     ActiveInferenceController, IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C,
 )
@@ -83,6 +84,8 @@ def run(
     arena_xml: str = "environment_sim/arena.xml",
     beta_path: str | None = None,
     log_path: str | None = None,
+    swc_path: str = "",
+    motor_readout: MotorReadout | None = None,
     verbose: bool = True,
 ) -> dict:
     """
@@ -99,8 +102,20 @@ def run(
         If None, a zero vector is used (produces flat PP-GLM likelihood).
     log_path : str or None
         Path to HDF5 log file.  If None, logging is skipped.
+    swc_path : str
+        Path to a neuron morphology SWC file exported by import_connectome.py
+        (e.g. data/connectome/skeletons/<bodyId>.swc).  Required: HHNeuron
+        will raise FileNotFoundError if the file is absent.
     verbose : bool
         Print progress every 1000 ms.
+
+    motor_readout : MotorReadout or None
+        Optional motor readout instance built from imported connectome assets
+        (see level2_bridge.motor_readout.load_motor_readout).  When provided,
+        motor commands are derived from motoneuron pool activations rather than
+        the heuristic mode_to_motor_command() path.  Requires spike_window to
+        be a (W, N) population array; the single-neuron fallback is used when
+        motor_readout is None.
 
     Returns
     -------
@@ -116,7 +131,7 @@ def run(
     )
 
     # Single HH neuron representing a readout projection neuron
-    neuron = HHNeuron(conductances={"g_KA": 1.0})
+    neuron = HHNeuron(swc_path=swc_path, conductances={"g_KA": 1.0})
     neuron.build()
 
     controller = ActiveInferenceController()
@@ -244,9 +259,20 @@ def run(
                 spike_posterior=last_spike_posterior,
             )
 
-            mode = select_action(controller)
-            last_cmd = mode_to_motor_command(mode, controller)
-            last_mode = int(mode)
+            if motor_readout is not None and len(spike_buffer_window) > 0:
+                # Motor readout path: spikes → pool rates → z_t → command.
+                # spike_buffer_window holds (W,) scalars from the single neuron
+                # stub; replace with a (W, N) population array when Level 1 is
+                # expanded to a full motor population.
+                pop_spikes = np.array(spike_buffer_window, dtype=float)[:, None]
+                motor_state = motor_readout.step(pop_spikes, DT_MS)
+                last_cmd = motor_state.command
+                last_mode = int(motor_state.mode)
+            else:
+                # Fallback: heuristic mode → command via policy.py
+                mode = select_action(controller)
+                last_cmd = mode_to_motor_command(mode, controller)
+                last_mode = int(mode)
 
             # Apply kinematic fallback step (replace with flybody.step())
             body_state = _kinematic_plant_step(body_state, last_cmd, DT_CTRL_MS * 1e-3)
@@ -299,6 +325,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Digital fly twin closed-loop sim")
     parser.add_argument("--duration", type=float, default=60_000.0,
                         help="Simulation duration in ms (default: 60000)")
+    parser.add_argument("--swc",  type=str, required=True,
+                        help="Path to SWC skeleton file (data/connectome/skeletons/<bodyId>.swc)")
     parser.add_argument("--log",   type=str, default=None,
                         help="HDF5 log file path (optional)")
     parser.add_argument("--beta",  type=str, default=None,
@@ -309,5 +337,6 @@ if __name__ == "__main__":
         duration_ms=args.duration,
         log_path=args.log,
         beta_path=args.beta,
+        swc_path=args.swc,
         verbose=not args.quiet,
     )

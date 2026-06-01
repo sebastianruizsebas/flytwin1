@@ -21,11 +21,14 @@ Reference defaults approximate Drosophila PN literature values
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
-from brian2 import Network, NeuronGroup, SpikeMonitor, TimedArray, defaultclock, ms, prefs
+from brian2 import Network, NeuronGroup, SpikeMonitor, TimedArray, defaultclock, ms, mV, uA, cm, prefs
 
+from utils.accelerator import BRIAN2_TARGET
 
-prefs.codegen.target = "numpy"
+prefs.codegen.target = BRIAN2_TARGET
 
 
 _INTEGRATION_DT_MS = 0.05
@@ -135,10 +138,13 @@ class HHNeuron:
         if conductances:
             self.conductances.update(conductances)
 
-        self._cell = None  # reserved for future NEURON cell object
-        self._group: NeuronGroup | None = None
+        self._cell = None  # legacy placeholder
+        self._group: NeuronGroup | None = None  # NeuronGroup OR SpatialNeuron
         self._network: Network | None = None
         self._spike_monitor: SpikeMonitor | None = None
+        # Compartmental model state — populated in build() when swc_path is valid
+        self._is_compartmental: bool = False
+        self._soma_section = None   # SpatialSubgroup for soma (set when compartmental)
         self._spike_times: list[float] = []
         self._t_ms: float = 0.0
 
@@ -157,18 +163,45 @@ class HHNeuron:
 
     def build(self) -> None:
         """
-        Build a one-neuron Brian2 network for the reduced model.
-        Override with NEURON SWC loader in the full compartmental extension.
+        Build the Brian2 network for this neuron.
+
+        When self.swc_path points to an existing SWC skeleton file (produced by
+        import_connectome.py), a multi-compartment Brian2 SpatialNeuron is
+        constructed from the morphology.  HH conductances are placed at the soma;
+        axon and dendrite compartments are passive cable.
+
+        When no SWC path is given (or the file is absent), a single-compartment
+        NeuronGroup is used as a fast fallback.  This keeps the PP-GLM fitting
+        workflow functional before connectome skeletons are imported.
         """
         if self._network is not None:
             return
 
-        defaultclock.dt = _INTEGRATION_DT_MS * ms
-        self._group = self._create_neuron_group(n_neurons=1)
-        self._spike_monitor = SpikeMonitor(self._group)
-        self._network = Network(self._group, self._spike_monitor)
-        self._apply_conductance_scaling(self._group)
-        self._assign_initial_state(self._group)
+        if not self.swc_path:
+            raise FileNotFoundError(
+                "HHNeuron.build() requires a valid SWC morphology file.\n"
+                "No swc_path was provided.  Run import_connectome.py with\n"
+                "--export-skeletons to download skeleton files into\n"
+                "data/connectome/skeletons/, then pass the path to HHNeuron."
+            )
+        if not os.path.exists(str(self.swc_path)):
+            raise FileNotFoundError(
+                f"HHNeuron.build() could not find the SWC file:\n"
+                f"  {self.swc_path}\n"
+                f"Run import_connectome.py with --export-skeletons to download\n"
+                f"skeleton files into data/connectome/skeletons/."
+            )
+
+        # ── Compartmental path: SWC → Brian2 SpatialNeuron ───────────────────
+        from level1_biophysics.compartmental_neuron import (
+            build_compartmental_network,
+            soma_section,
+        )
+        self._group, self._spike_monitor, self._network = \
+            build_compartmental_network(self.swc_path, self.conductances)
+        self._is_compartmental = True
+        self._soma_section = soma_section(self._group)
+
         self._network.store("resting")
         self._sync_from_group()
 
@@ -182,7 +215,12 @@ class HHNeuron:
             self.build()
 
         prev_spike_count = len(self._spike_monitor.t)
-        self._group.I_drive = float(current_uA)
+        if self._is_compartmental:
+            # Inject current density at soma only.
+            # µA/cm² → Brian2 unit: uA/cm**2
+            self._soma_section.I_drive = float(current_uA) * uA / cm**2
+        else:
+            self._group.I_drive = float(current_uA)
         self._network.run(float(dt_ms) * ms)
 
         new_spike_times = self._spike_monitor.t[prev_spike_count:] / ms
@@ -337,12 +375,26 @@ class HHNeuron:
     def _sync_from_group(self) -> None:
         if self._group is None:
             return
-        self._v = float(self._group.v[0])
-        self._m = float(self._group.m[0])
-        self._h = float(self._group.h[0])
-        self._n = float(self._group.n[0])
-        self._a = float(self._group.a[0])
-        self._b = float(self._group.b[0])
-        self._d = float(self._group.d_gate[0])
-        self._q = float(self._group.q[0])
+        if self._is_compartmental:
+            # SpatialNeuron: v is in Brian2 Volts; divide by mV for the
+            # dimensionless mV value expected by the rest of the interface.
+            src = self._soma_section
+            self._v = float(src.v[0] / mV)
+            self._m = float(src.m[0])
+            self._h = float(src.h[0])
+            self._n = float(src.n[0])
+            self._a = float(src.a[0])
+            self._b = float(src.b[0])
+            self._d = float(src.d_gate[0])
+            self._q = float(src.q[0])
+        else:
+            # NeuronGroup: v is dimensionless (stored as mV numerics)
+            self._v = float(self._group.v[0])
+            self._m = float(self._group.m[0])
+            self._h = float(self._group.h[0])
+            self._n = float(self._group.n[0])
+            self._a = float(self._group.a[0])
+            self._b = float(self._group.b[0])
+            self._d = float(self._group.d_gate[0])
+            self._q = float(self._group.q[0])
         self._above_thresh = self._v >= self.SPIKE_THRESHOLD_MV

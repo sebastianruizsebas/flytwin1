@@ -22,7 +22,12 @@ from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import minimize
 
-from .design_matrix import MAX_STIM_LAG_MS, N_COLS, build_design_row
+from utils.accelerator import xp, jit, to_np, to_xp, HAS_JAX
+from .design_matrix import (
+    MAX_STIM_LAG_MS, N_COLS,
+    build_design_row,
+    build_design_matrix_batch,
+)
 
 
 @dataclass(frozen=True)
@@ -55,32 +60,36 @@ def _gaussian_log_prior(value: np.ndarray, mean: np.ndarray, sigma: np.ndarray) 
     return float(-0.5 * np.sum(z ** 2 + np.log(2.0 * np.pi * sigma ** 2)))
 
 
-def _logsumexp(values: np.ndarray) -> float:
-    max_value = float(np.max(values))
-    return max_value + float(np.log(np.sum(np.exp(values - max_value))))
+def _gaussian_log_prior_batch(values, mean: np.ndarray, sigma: np.ndarray):
+    """
+    Vectorized Gaussian log-prior for C candidate states at once.
+
+    Parameters
+    ----------
+    values : (C, 3) array of candidate [c_left, c_right, delta_c] states.
+    mean   : (3,) prior mean.
+    sigma  : (3,) prior std.
+
+    Returns
+    -------
+    (C,) array of log-prior values.
+    """
+    sigma_xp = xp.maximum(to_xp(sigma), 1e-3)  # (3,)
+    mean_xp  = to_xp(mean)                       # (3,)
+    z = (values - mean_xp[None, :]) / sigma_xp[None, :]  # (C, 3)
+    return -0.5 * xp.sum(
+        z ** 2 + xp.log(2.0 * np.pi * sigma_xp[None, :] ** 2),
+        axis=1,
+    )  # (C,)
 
 
-def _candidate_design_rows(
-    spike_history_window: np.ndarray,
-    heading_window: np.ndarray,
-    wind_angle_window: np.ndarray,
-    c_left: float,
-    c_right: float,
-) -> np.ndarray:
-    drive = 1.5 * (c_left + c_right)
-    u_hist = np.full(MAX_STIM_LAG_MS, drive, dtype=float)
-    rows = np.empty((len(heading_window), N_COLS), dtype=float)
+def _logsumexp(values) -> float:
+    max_value = float(xp.max(values))
+    return max_value + float(xp.log(xp.sum(xp.exp(values - max_value))))
 
-    for t in range(len(heading_window)):
-        rows[t] = build_design_row(
-            u_sens_history=u_hist,
-            spike_history=spike_history_window[t],
-            heading=float(heading_window[t]),
-            c_left=c_left,
-            c_right=c_right,
-            wind_angle=float(wind_angle_window[t]),
-        )
-    return rows
+
+# _candidate_design_rows is replaced by build_design_matrix_batch from
+# design_matrix.py (vectorised over all grid candidates simultaneously).
 
 
 def infer_odor_posterior(
@@ -96,72 +105,91 @@ def infer_odor_posterior(
     """
     Infer a posterior over [c_left, c_right, delta_c] from the recent spike window.
 
-    The bridge uses a grid approximation over a low-dimensional odor latent state.
-    Candidate odor causes are converted into PP-GLM design rows, scored by the
-    Bernoulli spike likelihood, then combined with the Level 2 Gaussian prior.
+    GPU-accelerated: the 169-point (13×13) grid search is now a single batched
+    matrix multiply (C×W×24) @ (24,) → (C×W), followed by vectorised log-
+    likelihood and prior scoring.  No Python loop over grid candidates.
     """
     if spike_window.size == 0:
-        mean = prior_mean.astype(float).copy()
-        sigma = np.maximum(prior_sigma.astype(float), 1e-3)
         return OdorPosterior(
-            mean=mean,
-            sigma=sigma,
+            mean=prior_mean.astype(float).copy(),
+            sigma=np.maximum(prior_sigma.astype(float), 1e-3),
             log_evidence=0.0,
             map_log_likelihood=0.0,
         )
 
-    prior_mean = prior_mean.astype(float)
+    prior_mean  = prior_mean.astype(float)
     prior_sigma = np.maximum(prior_sigma.astype(float), 1e-3)
 
     c_mean_prior = max(0.0, 0.5 * (prior_mean[0] + prior_mean[1]))
     c_mean_sigma = max(0.1, 0.5 * (prior_sigma[0] + prior_sigma[1]))
-    delta_prior = float(prior_mean[2])
-    delta_sigma = max(0.1, float(prior_sigma[2]))
+    delta_prior  = float(prior_mean[2])
+    delta_sigma  = max(0.1, float(prior_sigma[2]))
 
-    c_max = max(1.5, c_mean_prior + 3.0 * c_mean_sigma)
+    c_max      = max(1.5, c_mean_prior + 3.0 * c_mean_sigma)
     delta_span = max(0.6, abs(delta_prior) + 3.0 * delta_sigma)
 
+    # Build flat candidate arrays (C = grid_size^2)
     c_mean_grid = np.linspace(0.0, c_max, grid_size)
-    delta_grid = np.linspace(-delta_span, delta_span, grid_size)
+    delta_grid  = np.linspace(-delta_span, delta_span, grid_size)
+    cm_mesh, dc_mesh = np.meshgrid(c_mean_grid, delta_grid, indexing='ij')  # (G, G)
+    c_left_all  = np.maximum(0.0, cm_mesh.ravel() + 0.5 * dc_mesh.ravel())  # (C,)
+    c_right_all = np.maximum(0.0, cm_mesh.ravel() - 0.5 * dc_mesh.ravel())  # (C,)
+    states_np   = np.stack([
+        c_left_all,
+        c_right_all,
+        c_left_all - c_right_all,
+    ], axis=1)  # (C, 3)
 
-    posterior_states = []
-    log_posts = []
-    map_log_likelihood = -np.inf
+    # ── Batched design matrix: (C, W, 24) on xp device ────────────────────────
+    X_batch = build_design_matrix_batch(
+        c_left_arr=c_left_all,
+        c_right_arr=c_right_all,
+        spike_hist_mat=spike_history_window,
+        heading_arr=heading_window,
+        wind_angle_arr=wind_angle_window,
+    )  # (C, W, 24) on xp
 
-    spike_window = spike_window.astype(float)
-    for c_mean in c_mean_grid:
-        for delta_c in delta_grid:
-            c_left = max(0.0, c_mean + 0.5 * delta_c)
-            c_right = max(0.0, c_mean - 0.5 * delta_c)
-            state = np.array([c_left, c_right, c_left - c_right], dtype=float)
-            X = _candidate_design_rows(
-                spike_history_window=spike_history_window,
-                heading_window=heading_window,
-                wind_angle_window=wind_angle_window,
-                c_left=c_left,
-                c_right=c_right,
-            )
-            candidate_log_lik = log_likelihood(X, spike_window, beta)
-            candidate_log_post = candidate_log_lik + _gaussian_log_prior(state, prior_mean, prior_sigma)
+    beta_xp = to_xp(np.asarray(beta, dtype=float))  # (24,)
+    y_xp    = to_xp(spike_window.astype(float))      # (W,)
 
-            posterior_states.append(state)
-            log_posts.append(candidate_log_post)
-            map_log_likelihood = max(map_log_likelihood, candidate_log_lik)
+    # ── Batch log-likelihood: (C, W, 24) × (24,) → logits (C, W) ────────
+    logits = X_batch @ beta_xp  # (C, W)
+    # Numerically stable sigmoid
+    p = xp.where(
+        logits >= 0,
+        1.0 / (1.0 + xp.exp(-logits)),
+        xp.exp(logits) / (1.0 + xp.exp(logits)),
+    )
+    p = xp.clip(p, 1e-9, 1.0 - 1e-9)  # (C, W)
 
-    states = np.vstack(posterior_states)
-    log_posts_arr = np.array(log_posts, dtype=float)
-    log_norm = _logsumexp(log_posts_arr)
-    weights = np.exp(log_posts_arr - log_norm)
+    log_lik_batch = xp.sum(
+        y_xp[None, :] * xp.log(p) + (1.0 - y_xp[None, :]) * xp.log(1.0 - p),
+        axis=1,
+    )  # (C,)
 
-    mean = np.sum(states * weights[:, None], axis=0)
-    var = np.sum(weights[:, None] * (states - mean) ** 2, axis=0)
-    sigma = np.sqrt(np.maximum(var, 1e-4))
+    # ── Batch Gaussian prior ──────────────────────────────────────────────
+    states_xp = to_xp(states_np)  # (C, 3)
+    log_prior_batch = _gaussian_log_prior_batch(states_xp, prior_mean, prior_sigma)  # (C,)
+
+    log_post_batch = log_lik_batch + log_prior_batch  # (C,)
+
+    # ── Normalise and compute posterior mean / std ─────────────────────────
+    log_norm   = _logsumexp(log_post_batch)
+    weights_xp = xp.exp(log_post_batch - log_norm)  # (C,)
+
+    # Bring back to numpy for output (avoids JAX device arrays escaping the module)
+    weights   = to_np(weights_xp).astype(float)   # (C,)
+    log_liks  = to_np(log_lik_batch).astype(float) # (C,)
+
+    post_mean = np.sum(states_np * weights[:, None], axis=0)          # (3,)
+    var       = np.sum(weights[:, None] * (states_np - post_mean) ** 2, axis=0)
+    post_sigma = np.sqrt(np.maximum(var, 1e-4))
 
     return OdorPosterior(
-        mean=mean,
-        sigma=sigma,
-        log_evidence=log_norm,
-        map_log_likelihood=float(map_log_likelihood),
+        mean=post_mean,
+        sigma=post_sigma,
+        log_evidence=float(log_norm),
+        map_log_likelihood=float(np.max(log_liks)),
     )
 
 
@@ -183,6 +211,11 @@ def fit_joint(
     """
     Jointly fit M GLMs with trend-filter penalty using L-BFGS-B.
 
+    When JAX is available the log-likelihood gradient is computed via JAX
+    autodiff (JIT-compiled, GPU-accelerated for large T).  The L-BFGS-B
+    optimiser itself still runs in scipy on the host; only the inner
+    gradient evaluation is accelerated.
+
     Parameters
     ----------
     X_list : list of (T_i, 24) arrays — design matrices per condition
@@ -197,32 +230,70 @@ def fit_joint(
     M = len(X_list)
     D = X_list[0].shape[1]  # 24
 
-    def objective_and_grad(flat_beta: np.ndarray):
-        betas = flat_beta.reshape(M, D)
-        loss = 0.0
-        grad = np.zeros_like(betas)
+    if HAS_JAX:
+        # ── JAX-accelerated gradient path ──────────────────────────────
+        import jax
+        import jax.numpy as jnp
 
-        # Negative log-likelihood sum over conditions
-        for i, (X, y) in enumerate(zip(X_list, y_list)):
-            eta = X @ betas[i]
-            p = sigmoid(eta)
-            p = np.clip(p, 1e-9, 1 - 1e-9)
-            loss -= float(np.sum(y * np.log(p) + (1 - y) * np.log(1 - p)))
-            grad[i] -= X.T @ (y - p)
+        # Convert once to JAX arrays (device transfer happens here)
+        Xs_jax = [jnp.asarray(X, dtype=jnp.float32) for X in X_list]
+        ys_jax = [jnp.asarray(y, dtype=jnp.float32) for y in y_list]
 
-        # Trend-filter penalty on adjacent beta vectors
-        if M > 1:
-            for i in range(M - 1):
-                diff = betas[i + 1] - betas[i]
-                pen = _smooth_l1(diff)
-                g = _smooth_l1_grad(diff)
-                loss += lam * pen
-                grad[i]     -= lam * g
-                grad[i + 1] += lam * g
+        @jax.jit
+        def _neg_ll_single(beta_i, X, y):
+            p = jax.nn.sigmoid(X @ beta_i)
+            p = jnp.clip(p, 1e-9, 1.0 - 1e-9)
+            return -jnp.sum(y * jnp.log(p) + (1.0 - y) * jnp.log(1.0 - p))
 
-        return loss, grad.ravel()
+        _neg_ll_and_grad = jax.jit(jax.value_and_grad(_neg_ll_single))
 
-    # Warm-start: independent logistic fits per condition
+        def objective_and_grad(flat_beta: np.ndarray):
+            betas = flat_beta.reshape(M, D)
+            loss = 0.0
+            grad = np.zeros_like(betas)
+
+            for i, (X, y) in enumerate(zip(Xs_jax, ys_jax)):
+                beta_i = jnp.asarray(betas[i], dtype=jnp.float32)
+                nll, g = _neg_ll_and_grad(beta_i, X, y)
+                loss += float(nll)
+                grad[i] += np.asarray(g, dtype=float)
+
+            if M > 1:
+                for i in range(M - 1):
+                    diff = betas[i + 1] - betas[i]
+                    pen = _smooth_l1(diff)
+                    g = _smooth_l1_grad(diff)
+                    loss += lam * pen
+                    grad[i]     -= lam * g
+                    grad[i + 1] += lam * g
+
+            return loss, grad.ravel()
+
+    else:
+        # ── Pure-numpy gradient path (fallback) ──────────────────────────
+        def objective_and_grad(flat_beta: np.ndarray):
+            betas = flat_beta.reshape(M, D)
+            loss = 0.0
+            grad = np.zeros_like(betas)
+
+            for i, (X, y) in enumerate(zip(X_list, y_list)):
+                eta = X @ betas[i]
+                p = sigmoid(eta)
+                p = np.clip(p, 1e-9, 1 - 1e-9)
+                loss -= float(np.sum(y * np.log(p) + (1 - y) * np.log(1 - p)))
+                grad[i] -= X.T @ (y - p)
+
+            if M > 1:
+                for i in range(M - 1):
+                    diff = betas[i + 1] - betas[i]
+                    pen = _smooth_l1(diff)
+                    g = _smooth_l1_grad(diff)
+                    loss += lam * pen
+                    grad[i]     -= lam * g
+                    grad[i + 1] += lam * g
+
+            return loss, grad.ravel()
+
     beta0 = np.zeros(M * D)
     result = minimize(
         objective_and_grad,

@@ -39,3 +39,10 @@ dependencies:
       - dm_control
       # Janelia fly body model
       - git+https://github.com/TuragaLab/flybody.git
+      # ── GPU / JAX acceleration ──────────────────────────────────────────
+      # GPU (CUDA 12): install this on Linux/Windows with CUDA 12 toolkit.
+      # Replace with 'jax[cpu]' if no NVIDIA GPU is available.
+      - jax[cuda12]
+      # brian2cuda enables GPU-based Brian2 sims (requires CUDA 12 + cmake):
+      #   pip install brian2cuda
+      # (commented out because it requires a separate build step)

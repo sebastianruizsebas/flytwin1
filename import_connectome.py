@@ -21,6 +21,7 @@ from scipy import sparse
 
 
 DEFAULT_SERVER = "neuprint.janelia.org"
+DEFAULT_DATASET = "male-cns:v0.9"
 DEFAULT_OUT_DIR = Path("data/connectome")
 
 
@@ -212,7 +213,7 @@ def run_import(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Import neuPrint connectome assets into data/connectome")
     parser.add_argument("--server", default=DEFAULT_SERVER, help="neuPrint server hostname")
-    parser.add_argument("--dataset", default=None, help="neuPrint dataset name to import")
+    parser.add_argument("--dataset", default=DEFAULT_DATASET, help="neuPrint dataset name to import (default: male-cns:v0.9)")
     parser.add_argument("--token", default=None, help="neuPrint token (optional if provided via environment)")
     parser.add_argument("--token-env", default="NEUPRINT_TOKEN", help="Primary environment variable to read the token from")
     parser.add_argument("--out-dir", default=str(DEFAULT_OUT_DIR), help="Output directory for connectome assets")
@@ -260,9 +261,6 @@ def main() -> None:
     if args.list_datasets:
         list_datasets(server=args.server, token=token)
         return
-
-    if not args.dataset:
-        parser.error("--dataset is required unless --list-datasets is used")
 
     run_import(
         server=args.server,

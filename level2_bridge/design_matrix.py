@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from utils.accelerator import xp, to_xp, to_np
+
 N_COLS = 24
 N_STIM_BASIS = 10
 N_HIST_BASIS = 10
@@ -56,6 +58,27 @@ def _bell_basis(value: float, centers: np.ndarray, width_scale: float = 1.0) -> 
 _STIM_LAGS = _bell_basis_lags(N_STIM_BASIS, MAX_STIM_LAG_MS, nonlinear=True)
 _HIST_LAGS = _bell_basis_lags(N_HIST_BASIS, MAX_HIST_LAG_MS, nonlinear=False)
 
+# ── Pre-computed integer lag indices (eliminates Python loops at runtime) ─────
+# Stimulus lags: 0-based index into u_sens_history counted from the end.
+# A lag_idx of L means u_sens_history[-(L+1)].  Lags >= MAX_STIM_LAG_MS are
+# out of range for a MAX_STIM_LAG_MS-length history and are masked to 0.
+_STIM_LAG_IDX: np.ndarray = np.array(
+    [int(round(lag)) for lag in _STIM_LAGS], dtype=np.intp
+)
+_STIM_LAG_VALID: np.ndarray = _STIM_LAG_IDX < MAX_STIM_LAG_MS
+# Clamped indices that are safe to use even for out-of-range lags (masked away)
+_STIM_LAG_SAFE: np.ndarray = np.where(_STIM_LAG_VALID, _STIM_LAG_IDX, 0)
+
+# Spike-history lags: lag_idx=0 is excluded (can't reference "this" spike).
+# lag_idx L means spike_history[-L].  Lags > MAX_HIST_LAG_MS are masked to 0.
+_HIST_LAG_IDX: np.ndarray = np.array(
+    [int(round(lag)) for lag in _HIST_LAGS], dtype=np.intp
+)
+_HIST_LAG_VALID: np.ndarray = (
+    (_HIST_LAG_IDX > 0) & (_HIST_LAG_IDX <= MAX_HIST_LAG_MS)
+)
+_HIST_LAG_SAFE: np.ndarray = np.where(_HIST_LAG_VALID, _HIST_LAG_IDX, 1)  # >=1 to avoid index 0
+
 
 def build_design_row(
     u_sens_history: np.ndarray,
@@ -68,49 +91,40 @@ def build_design_row(
     """
     Build a single 24-element design vector x_t.
 
+    Fully vectorized: no Python loops.  Pre-computed index arrays
+    (_STIM_LAG_SAFE, _HIST_LAG_SAFE) replace the per-lag for-loops.
+    Works with plain numpy arrays; the return value is always numpy so it
+    can be fed directly into scipy or Brian2 without conversion.
+
     Parameters
     ----------
-    u_sens_history : np.ndarray
-        (MAX_STIM_LAG_MS,) array of past sensory drive values, most recent last.
-        Values outside the trial are assumed 0.
-    spike_history : np.ndarray
-        (MAX_HIST_LAG_MS,) binary array of past spikes, most recent last.
-    heading : float
-        Current heading angle (rad).
-    c_left, c_right : float
-        Bilateral odor concentrations after sigmoid gain.
-    wind_angle : float
-        Wind direction relative to body heading (rad).
+    u_sens_history : (MAX_STIM_LAG_MS,) array, most recent last.
+    spike_history  : (MAX_HIST_LAG_MS,) binary array, most recent last.
+    heading        : current heading angle (rad).
+    c_left, c_right: bilateral odor concentrations.
+    wind_angle     : wind direction relative to body heading (rad).
 
     Returns
     -------
     np.ndarray shape (24,)
     """
-    row = np.empty(N_COLS)
-    row[0] = 1.0  # baseline constant
+    u = np.asarray(u_sens_history)
+    s = np.asarray(spike_history)
 
-    # Stimulus filter (columns 1–10): project u_sens history onto bell bases
-    # Each basis value is the inner product of the history at the basis lag
-    stim_feats = np.zeros(N_STIM_BASIS)
-    for j, lag in enumerate(_STIM_LAGS):
-        lag_idx = int(round(lag))
-        if lag_idx < len(u_sens_history):
-            # Index from end: lag=0 is most recent
-            stim_feats[j] = u_sens_history[-(lag_idx + 1)] if lag_idx < len(u_sens_history) else 0.0
-    row[1:11] = stim_feats
+    # Vectorized stimulus lookup: u[-(lag+1)] for each lag in one index op
+    stim_raw  = u[-(1 + _STIM_LAG_SAFE)]          # (10,)
+    stim_feats = np.where(_STIM_LAG_VALID, stim_raw, 0.0)
 
-    # Spike-history filter (columns 11–20)
-    hist_feats = np.zeros(N_HIST_BASIS)
-    for j, lag in enumerate(_HIST_LAGS):
-        lag_idx = int(round(lag))
-        if lag_idx > 0 and lag_idx <= len(spike_history):
-            hist_feats[j] = spike_history[-lag_idx]
-    row[11:21] = hist_feats
+    # Vectorized spike-history lookup: s[-lag] for each lag in one index op
+    hist_raw   = s[-_HIST_LAG_SAFE]               # (10,)
+    hist_feats = np.where(_HIST_LAG_VALID, hist_raw, 0.0)
 
-    row[21] = heading
-    row[22] = c_left - c_right          # bilateral odor gradient delta_c
-    row[23] = wind_angle                # wind relative to heading
-    return row
+    return np.concatenate([
+        [1.0],
+        stim_feats,
+        hist_feats,
+        [heading, c_left - c_right, wind_angle],
+    ])
 
 
 def build_design_matrix(
@@ -146,3 +160,87 @@ def build_design_matrix(
             wind_angle=float(wind_angle_trace[t]),
         )
     return X
+
+
+def build_design_matrix_batch(
+    c_left_arr: np.ndarray,
+    c_right_arr: np.ndarray,
+    spike_hist_mat: np.ndarray,
+    heading_arr: np.ndarray,
+    wind_angle_arr: np.ndarray,
+):
+    """
+    Build design matrices for C candidate odor states × W time steps at once.
+
+    This is the GPU-ready batch version used by ``ppglm.infer_odor_posterior``
+    to replace its 169-iteration Python grid loop.  The computation is a set
+    of pure array operations with no Python-level iteration over candidates or
+    timesteps, making it JIT-compilable with JAX.
+
+    Parameters
+    ----------
+    c_left_arr  : (C,) array of candidate left-antenna concentrations.
+    c_right_arr : (C,) array of candidate right-antenna concentrations.
+    spike_hist_mat : (W, MAX_HIST_LAG_MS) spike history at each timestep.
+    heading_arr : (W,) heading angle at each timestep (rad).
+    wind_angle_arr : (W,) wind angle relative to heading at each timestep (rad).
+
+    Returns
+    -------
+    xp array of shape (C, W, N_COLS=24).
+
+    Biological note
+    ---------------
+    For the odor-posterior grid search, u_sens is treated as a constant drive
+    equal to 1.5 × (c_left + c_right) for each candidate.  This reflects the
+    assumption that a candidate odor state would have driven a constant mean
+    current to the HH neuron over the observation window — consistent with how
+    ``_candidate_design_rows`` worked in the scalar-loop version.
+    """
+    c_left_arr  = to_xp(np.asarray(c_left_arr,  dtype=float))  # (C,)
+    c_right_arr = to_xp(np.asarray(c_right_arr, dtype=float))  # (C,)
+    s_mat = to_xp(np.asarray(spike_hist_mat, dtype=float))      # (W, H)
+    h_arr = to_xp(np.asarray(heading_arr,    dtype=float))      # (W,)
+    w_arr = to_xp(np.asarray(wind_angle_arr, dtype=float))      # (W,)
+
+    import numpy as _np  # local alias to use numpy index arrays in both backends
+    C = c_left_arr.shape[0]
+    W = h_arr.shape[0]
+
+    # ── Stimulus features (C, W, N_STIM_BASIS) ───────────────────────────────
+    # For a constant-drive history = 1.5*(c_left+c_right), all lag lookups
+    # return that drive value (for valid lags) or 0 (for out-of-range lags).
+    drive = 1.5 * (c_left_arr + c_right_arr)          # (C,)
+    stim_scale = to_xp(_STIM_LAG_VALID.astype(float)) # (10,) mask
+    # (C, 1, 10) × (1, 1, 10) broadcast → (C, 1, 10) → expand to (C, W, 10)
+    stim_3d = (drive[:, None, None] * stim_scale[None, None, :])  # (C, 1, 10)
+    stim_3d = xp.broadcast_to(stim_3d, (C, W, N_STIM_BASIS))
+
+    # ── Spike-history features (C, W, N_HIST_BASIS) ──────────────────────────
+    # History is the same for all candidates; varies per timestep.
+    hist_raw  = s_mat[:, -_HIST_LAG_SAFE]             # (W, 10) — numpy fancy index
+    hist_mask = to_xp(_HIST_LAG_VALID.astype(float))  # (10,)
+    hist_masked = to_xp(to_np(hist_raw)) * hist_mask[None, :]  # (W, 10)
+    hist_3d = xp.broadcast_to(hist_masked[None, :, :], (C, W, N_HIST_BASIS))
+
+    # ── Scalar columns ────────────────────────────────────────────────────────
+    baseline_3d = xp.ones((C, W, 1))
+
+    heading_3d = xp.broadcast_to(h_arr[None, :, None], (C, W, 1))
+
+    delta_c = (c_left_arr - c_right_arr)[:, None, None]  # (C, 1, 1)
+    delta_3d = xp.broadcast_to(delta_c, (C, W, 1))
+
+    wind_3d = xp.broadcast_to(w_arr[None, :, None], (C, W, 1))
+
+    # ── Concatenate → (C, W, 24) ─────────────────────────────────────────────
+    # Must copy broadcast-only views before concatenation (JAX handles this
+    # automatically; numpy requires it for contiguous output).
+    return xp.concatenate([
+        baseline_3d,   # col 0
+        stim_3d,       # cols 1–10
+        hist_3d,       # cols 11–20
+        heading_3d,    # col 21
+        delta_3d,      # col 22
+        wind_3d,       # col 23
+    ], axis=-1)  # (C, W, 24)
