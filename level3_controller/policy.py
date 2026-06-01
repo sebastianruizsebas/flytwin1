@@ -25,6 +25,7 @@ from enum import IntEnum
 
 import numpy as np
 
+from .generative_model import StateBelief
 from .active_inference import (
     ActiveInferenceController,
     BehavioralMode,
@@ -40,43 +41,23 @@ from .active_inference import (
 )
 
 
-# ── Preferred Level 2 state priors p(s²) ────────────────────────────────────
-# Used in the pragmatic KL term: agent prefers states with high odor and low
-# obstacle/food distance.
-_PREF_FOOD_DIST    = 0.0    # want to reach food
-_PREF_OBS_DIST     = 0.3    # prefer to be away from obstacles
-_PREF_ODOR         = 0.8    # prefer high odor concentration
-
-# Weights for each dimension in the KL approximation
-_PREF_WEIGHT = np.array([
-    0.0,   # x — no absolute position preference
-    0.0,   # y
-    0.0,   # theta
-    1.0,   # c_left   — prefer high odor
-    1.0,   # c_right
-    0.5,   # delta_c  — prefer symmetric (near 0) unless casting
-    0.0,   # w_x
-    0.0,   # w_y
-    2.0,   # d_obs    — strong preference for distance from obstacles
-    3.0,   # d_food   — strongest preference for approaching food
-])
-
-
 def _pragmatic_cost(
     mu_predicted: np.ndarray,
     sigma_predicted: np.ndarray,
     mode: BehavioralMode,
+    controller: ActiveInferenceController,
 ) -> float:
     """
-    Weighted squared deviation of predicted state from preferred state.
-    Lower = more pragmatically preferred.
-    Mode-specific preferred states capture different sub-goals.
+    Weighted squared deviation of predicted state from preferred outcomes.
+
+    Theoretical underpinning: this is the project's current approximation to
+    a prior-preference term over outcomes, not the filtering prior over hidden
+    state.  That distinction matters for active inference because the agent's
+    beliefs about what *is* should be separated from what it biologically or
+    task-wise *wants* to encounter.
     """
-    pref = np.zeros(len(mu_predicted))
-    pref[IDX_C_LEFT]  = _PREF_ODOR
-    pref[IDX_C_RIGHT] = _PREF_ODOR
-    pref[IDX_D_OBS]   = _PREF_OBS_DIST
-    pref[IDX_D_FOOD]  = _PREF_FOOD_DIST
+    pref = controller.preferred_outcomes.preferred_mu.copy()
+    pref_weight = controller.preferred_outcomes.preferred_weight
 
     if mode == BehavioralMode.SURGE:
         # SURGE: move toward food, tolerate asymmetric odor
@@ -86,12 +67,12 @@ def _pragmatic_cost(
         pref[IDX_DELTA_C] = 0.3  # some asymmetry expected during casting
     elif mode == BehavioralMode.AVOID:
         # AVOID: strongly prefer being away from obstacles
-        pref[IDX_D_OBS] = _PREF_OBS_DIST * 2.0
+        pref[IDX_D_OBS] = pref[IDX_D_OBS] * 2.0
     elif mode == BehavioralMode.STOP:
         # STOP: food distance near zero, odor high
         pref[IDX_D_FOOD] = 0.0
 
-    sq_dev = _PREF_WEIGHT * (mu_predicted - pref) ** 2
+    sq_dev = pref_weight * (mu_predicted - pref) ** 2
     return float(np.sum(sq_dev))
 
 
@@ -113,37 +94,21 @@ def _predict_state(
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     One-step prediction of mu and sigma under a given mode's typical action.
-    Uses simplified kinematic model: heading-aligned forward/lateral displacement.
+
+    Theoretical underpinning: policy evaluation should roll forward the same
+    transition model used by the filtering prior, otherwise expected free energy
+    is scored under a different dynamics model than the one used for inference.
     Returns (mu_pred, sigma_pred).
     """
-    mu = controller.body_state.mu.copy()
-    sigma = controller.body_state.sigma.copy()
-    theta = float(mu[IDX_THETA])
-
-    # Typical forward speeds per mode (m/s)
-    _SPEED = {
-        BehavioralMode.SURGE: 0.008,
-        BehavioralMode.CAST:  0.004,
-        BehavioralMode.AVOID: 0.005,
-        BehavioralMode.STOP:  0.0,
-    }
-    # Typical yaw rates (rad/s)
-    _YAW = {
-        BehavioralMode.SURGE: 0.0,
-        BehavioralMode.CAST:  2.0,    # lateral sweep
-        BehavioralMode.AVOID: 3.0,    # turning away from obstacle
-        BehavioralMode.STOP:  0.0,
-    }
-
-    speed = _SPEED[mode]
-    mu[0] += speed * np.cos(theta) * dt     # x
-    mu[1] += speed * np.sin(theta) * dt     # y
-    mu[IDX_THETA] += _YAW[mode] * dt
-
-    # Inflate sigma with process noise (same as controller predict step)
-    sigma = np.sqrt(sigma ** 2 + (controller._PROCESS_NOISE * dt / 0.02) ** 2)
-
-    return mu, sigma
+    predicted = controller.transition_model.predict(
+        belief=StateBelief(
+            mu=controller.body_state.mu.copy(),
+            sigma=controller.body_state.sigma.copy(),
+        ),
+        action=mode_to_motor_command(mode, controller),
+        dt=dt,
+    )
+    return predicted.mu, predicted.sigma
 
 
 def expected_free_energy(
@@ -158,7 +123,7 @@ def expected_free_energy(
     Lower G → more preferred mode.
     """
     mu_pred, sigma_pred = _predict_state(controller, mode)
-    pragmatic = _pragmatic_cost(mu_pred, sigma_pred, mode)
+    pragmatic = _pragmatic_cost(mu_pred, sigma_pred, mode, controller)
     epistemic = _epistemic_value(sigma_pred, mode)
     return pragmatic + epistemic  # epistemic already negative when uncertainty low
 

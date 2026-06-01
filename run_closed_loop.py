@@ -134,14 +134,6 @@ def run(
     neuron = HHNeuron(swc_path=swc_path, conductances={"g_KA": 1.0})
     neuron.build()
 
-    controller = ActiveInferenceController()
-
-    # Load pre-fitted PP-GLM beta (24-dim); fall back to zeros
-    if beta_path is not None:
-        beta = np.load(beta_path)
-    else:
-        beta = np.zeros(24)
-
     # Simulated body state (kinematic fallback)
     body_state: dict = {
         "x": -0.5, "y": 0.0, "theta": 0.0,
@@ -149,6 +141,17 @@ def run(
         "w_x": 0.2, "w_y": 0.0,
         "c_left": 0.0, "c_right": 0.0,
     }
+
+    # Seed the filtering prior p(s_0) from the known start pose and wind rather
+    # than from an uninformative zero vector. This keeps the controller's prior
+    # belief distinct from the policy-level preferred outcomes used later.
+    controller = ActiveInferenceController(initial_obs=body_state)
+
+    # Load pre-fitted PP-GLM beta (24-dim); fall back to zeros
+    if beta_path is not None:
+        beta = np.load(beta_path)
+    else:
+        beta = np.zeros(24)
 
     # Running histories for the spike bridge construction
     s_hist: List[int]   = [0]   * MAX_HIST_LAG_MS
@@ -254,6 +257,10 @@ def run(
         if ctrl_counter >= DT_CTRL_MS:
             ctrl_counter = 0.0
 
+            # Feed the previously applied command back into the controller as an
+            # efference-copy style action input. The predictive prior should be
+            # conditioned on what the body just did, not only on the last state.
+            controller.set_last_motor(last_cmd)
             controller.update_beliefs(
                 mujoco_obs=body_state,
                 spike_posterior=last_spike_posterior,
@@ -276,6 +283,7 @@ def run(
 
             # Apply kinematic fallback step (replace with flybody.step())
             body_state = _kinematic_plant_step(body_state, last_cmd, DT_CTRL_MS * 1e-3)
+            controller.set_last_motor(last_cmd)
 
             log_positions.append(np.array([body_state["x"], body_state["y"], body_state["theta"]]))
             log_modes.append(last_mode)

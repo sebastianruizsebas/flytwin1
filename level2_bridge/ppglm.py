@@ -88,6 +88,52 @@ def _logsumexp(values) -> float:
     return max_value + float(xp.log(xp.sum(xp.exp(values - max_value))))
 
 
+def neural_log_likelihood(
+    spike_window: np.ndarray,
+    beta: np.ndarray,
+    spike_history_window: np.ndarray,
+    heading_window: np.ndarray,
+    wind_angle_window: np.ndarray,
+    candidate_odor_state: np.ndarray,
+) -> float:
+    """
+    Evaluate log p(o_neural | s_odor) for one candidate odor state.
+
+    Parameters
+    ----------
+    candidate_odor_state : (3,) array-like
+        Candidate [c_left, c_right, delta_c] state.  The PP-GLM design matrix
+        is parameterised by c_left and c_right; delta_c is implied as their
+        difference and is accepted here for interface consistency.
+    """
+    if spike_window.size == 0:
+        return 0.0
+
+    candidate = np.asarray(candidate_odor_state, dtype=float).reshape(3)
+    c_left = max(0.0, float(candidate[0]))
+    c_right = max(0.0, float(candidate[1]))
+
+    X = build_design_matrix_batch(
+        c_left_arr=np.array([c_left], dtype=float),
+        c_right_arr=np.array([c_right], dtype=float),
+        spike_hist_mat=np.asarray(spike_history_window, dtype=float),
+        heading_arr=np.asarray(heading_window, dtype=float),
+        wind_angle_arr=np.asarray(wind_angle_window, dtype=float),
+    )[0]  # (W, 24)
+
+    beta_xp = to_xp(np.asarray(beta, dtype=float))
+    y_xp = to_xp(np.asarray(spike_window, dtype=float))
+
+    logits = X @ beta_xp
+    p = xp.where(
+        logits >= 0,
+        1.0 / (1.0 + xp.exp(-logits)),
+        xp.exp(logits) / (1.0 + xp.exp(logits)),
+    )
+    p = xp.clip(p, 1e-9, 1.0 - 1e-9)
+    return float(xp.sum(y_xp * xp.log(p) + (1.0 - y_xp) * xp.log(1.0 - p)))
+
+
 # _candidate_design_rows is replaced by build_design_matrix_batch from
 # design_matrix.py (vectorised over all grid candidates simultaneously).
 

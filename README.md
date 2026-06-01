@@ -192,6 +192,57 @@ python generate_training_data.py \
 
 ---
 
+### How the PP-GLM is fit from sensory stimuli
+
+The script implements this pipeline for every (position, conductance) combination:
+
+```
+OdorPlume.step()              → c_left(t), c_right(t)   [antenna concentrations]
+    ↓  mean + 1/f noise drive
+HHNeuron.simulate_spike_trials() → spikes(n_trials, T)  [Level 1 output]
+    ↓  build_design_matrix()
+X (T × 24)                       [design matrix per trial]
+    ↓  fit_joint([X_cond1, X_cond2, …], [y_cond1, …], lam)
+beta (24,)                       [PP-GLM filter coefficients]
+```
+
+**The 24 design matrix columns and what sensory stimulus each encodes:**
+
+| Column(s) | Name | Sensory signal captured |
+|-----------|------|--------------------------|
+| 0 | Intercept | Baseline firing rate (no stimulus) |
+| 1–10 | Stimulus filter | Past odor drive `u_sens(t-τ)` at 10 log-spaced lags τ ∈ [0, 200 ms]. The fitted weights reveal the integration window: a narrow peak near τ=0 means fast transduction; a broader peak means temporal summation. |
+| 11–20 | Spike-history filter | Past spikes at 10 linearly spaced lags τ ∈ [1, 100 ms]. Negative weights at short lags = refractoriness; positive at longer lags = burst facilitation. |
+| 21 | Heading θ | Body orientation — allows spike rate to vary with direction of travel relative to the plume. |
+| 22 | Bilateral gradient Δc | `c_left − c_right` — non-zero only when the fly is at a plume edge. Lateral starting positions in the sweep ensure this column is exercised. |
+| 23 | Wind angle | Direction of mean wind relative to heading — encodes upwind/downwind cues. |
+
+**Why position diversity matters for stimulus filter quality:**
+
+If the fly always starts on the plume centreline, the stimulus filter only sees
+high-concentration, symmetric encounters.  The stimulus filter columns (1–10)
+will over-fit to sustained drive and miss the onset/offset dynamics.  Starting
+positions at varied upwind distances and lateral offsets force the filter to
+learn from both strong pulses (near source, on-axis) and sparse whiffs
+(far upwind, off-axis), giving a filter that generalises across the full
+plume encounter statistics the closed-loop agent will experience.
+
+**How `fit_joint` ties the conductance sweep together:**
+
+`fit_joint` fits one beta per conductance condition simultaneously.  The
+trend-filter penalty (`--lam`) penalises abrupt changes between adjacent
+conditions in the conductance grid:
+
+$$\mathcal{L}(\beta_1,\ldots,\beta_M) = -\sum_i \log P(\text{data}_i \mid \beta_i) + \lambda \sum_i \|\beta_{i+1} - \beta_i\|_1$$
+
+This means the resulting `betas_all.npy` matrix smoothly interpolates the
+PP-GLM filter shape across the conductance landscape — so you can later
+extract a beta for any (g_KA, g_Na, g_CaL) combination without re-fitting.
+The nominal beta saved to `beta.npy` corresponds to biologically standard
+conductances (all scale factors = 1.0).
+
+---
+
 ## Step 6 — Run the closed-loop simulation
 
 Pass the path to any exported SWC skeleton via `--swc`.  Substitute the body ID
@@ -230,7 +281,7 @@ mode history is printed at completion.
 
 ---
 
-## Step 8 — Inspect results
+## Step 7 — Inspect results
 
 **Closed-loop run log:**
 

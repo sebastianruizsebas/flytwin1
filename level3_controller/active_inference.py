@@ -38,6 +38,12 @@ from enum import IntEnum
 import numpy as np
 
 from level2_bridge.ppglm import OdorPosterior
+from .generative_model import (
+    ObservationModel,
+    PreferredOutcomeModel,
+    StateBelief,
+    TransitionModel,
+)
 
 
 class BehavioralMode(IntEnum):
@@ -127,6 +133,28 @@ class TaskState:
 class ActiveInferenceController:
     """Maintains q(s^2) and q(s^3) on a 20 ms control cycle."""
 
+    _CTRL_DT_S = 0.02
+
+    # The initial filtering prior p(s_0) should reflect what is already known
+    # before new evidence arrives: start pose and mean wind are usually known
+    # from arena setup, while plume contact is intermittent and therefore kept
+    # as a low-concentration, high-uncertainty prior.
+    _INITIAL_SIGMA = np.array([
+        0.02,
+        0.02,
+        0.05,
+        0.25,
+        0.25,
+        0.30,
+        0.05,
+        0.05,
+        0.15,
+        0.10,
+    ])
+    _LOW_ODOR_PRIOR = 0.05
+    _DEFAULT_WIND_PRIOR = np.array([0.2, 0.0])
+    _DEFAULT_OBS_PRIOR = 1.0
+
     _PROCESS_NOISE = np.array([
         0.005,
         0.005,
@@ -140,23 +168,130 @@ class ActiveInferenceController:
         0.01,
     ])
 
-    _OBS_NOISE_BODY = np.array([
+    # Direct body/environment observation model. Odor concentrations are kept
+    # out of this body term for now so the PP-GLM remains the explicit odor
+    # likelihood bridge and we avoid double-counting plume evidence.
+    _BODY_OBS_KEYS = ("x", "y", "theta", "w_x", "w_y", "d_obs", "d_food")
+    _BODY_OBS_INDICES = (IDX_X, IDX_Y, IDX_THETA, IDX_WX, IDX_WY, IDX_D_OBS, IDX_D_FOOD)
+    _BODY_OBS_SIGMA = np.array([
         0.002,
         0.002,
         0.01,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
-        0.0,
+        0.02,
+        0.02,
         0.02,
         0.005,
     ])
 
-    def __init__(self):
-        self.body_state = BodyEnvState()
+    def __init__(self, initial_obs: dict | None = None):
+        self.initial_state_prior = self._build_initial_state_prior(initial_obs)
+        self.predictive_prior = self.initial_state_prior.copy()
+        self.body_state = BodyEnvState(
+            mu=self.initial_state_prior.mu.copy(),
+            sigma=self.initial_state_prior.sigma.copy(),
+        )
         self.task_state = TaskState()
-        self._last_motor: dict = {}
+        # Stores the last applied motor command as an efference-copy signal used
+        # by P(s'|s,a). This lets the controller predict how its own locomotor
+        # output should move the body before new sensory evidence arrives.
+        self._last_motor: dict = {
+            "forward_speed": 0.0,
+            "yaw_rate": 0.0,
+            "sidestep": 0.0,
+            "active": True,
+        }
+        self.preferred_outcomes = self._build_preferred_outcomes()
+        self.transition_model = TransitionModel(process_noise=self._PROCESS_NOISE)
+        self.observation_model = ObservationModel(
+            body_obs_keys=self._BODY_OBS_KEYS,
+            body_obs_indices=self._BODY_OBS_INDICES,
+            body_obs_sigma=self._BODY_OBS_SIGMA,
+            odor_indices=(IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C),
+        )
+        self.last_body_log_likelihood = 0.0
+        self.last_neural_log_likelihood = 0.0
+        self.last_total_log_likelihood = 0.0
+
+    def set_last_motor(self, motor_command: dict | None) -> None:
+        """
+        Store the last applied action for the next predictive prior update.
+
+        Theoretical underpinning: the predictive prior should condition on the
+        previous action. In a biological framing this is a coarse efference-copy
+        channel from the selected locomotor command back into state prediction.
+        """
+        cmd = motor_command or {}
+        self._last_motor = {
+            "forward_speed": float(cmd.get("forward_speed", 0.0)),
+            "yaw_rate": float(cmd.get("yaw_rate", 0.0)),
+            "sidestep": float(cmd.get("sidestep", 0.0)),
+            "active": bool(cmd.get("active", True)),
+        }
+
+    @classmethod
+    def _build_initial_state_prior(cls, initial_obs: dict | None) -> StateBelief:
+        """
+        Construct the initial filtering prior p(s_0) from known setup variables.
+
+        Theoretical underpinning: p(s_0) should capture what the controller
+        already believes before the first online evidence update.  Pose and wind
+        start relatively narrow because the arena setup makes them known, while
+        odor remains broad because turbulent plume encounters are intermittent.
+        """
+        obs = initial_obs or {}
+        mu = np.zeros(STATE_DIM, dtype=float)
+        sigma = cls._INITIAL_SIGMA.astype(float).copy()
+
+        mu[IDX_X] = float(obs.get("x", 0.0))
+        mu[IDX_Y] = float(obs.get("y", 0.0))
+        mu[IDX_THETA] = float(obs.get("theta", 0.0))
+
+        c_left = max(0.0, float(obs.get("c_left", cls._LOW_ODOR_PRIOR)))
+        c_right = max(0.0, float(obs.get("c_right", cls._LOW_ODOR_PRIOR)))
+        mu[IDX_C_LEFT] = c_left
+        mu[IDX_C_RIGHT] = c_right
+        mu[IDX_DELTA_C] = c_left - c_right
+
+        mu[IDX_WX] = float(obs.get("w_x", cls._DEFAULT_WIND_PRIOR[0]))
+        mu[IDX_WY] = float(obs.get("w_y", cls._DEFAULT_WIND_PRIOR[1]))
+        mu[IDX_D_OBS] = float(obs.get("d_obs", cls._DEFAULT_OBS_PRIOR))
+
+        default_d_food = float(np.hypot(mu[IDX_X], mu[IDX_Y]))
+        mu[IDX_D_FOOD] = float(obs.get("d_food", default_d_food))
+
+        return StateBelief(mu=mu, sigma=sigma)
+
+    @staticmethod
+    def _build_preferred_outcomes() -> PreferredOutcomeModel:
+        """
+        Build prior preferences p*(o) used by the pragmatic term in policy.py.
+
+        Biological rationale: these are not beliefs about the current state.
+        They encode the ethological objective of the walking task: keep odor on,
+        stay clear of obstacles, and approach then stop at the feeder.
+        """
+        preferred_mu = np.zeros(STATE_DIM, dtype=float)
+        preferred_mu[IDX_C_LEFT] = 0.8
+        preferred_mu[IDX_C_RIGHT] = 0.8
+        preferred_mu[IDX_D_OBS] = 0.3
+        preferred_mu[IDX_D_FOOD] = 0.0
+
+        preferred_weight = np.array([
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            1.0,
+            0.5,
+            0.0,
+            0.0,
+            2.0,
+            3.0,
+        ])
+        return PreferredOutcomeModel(
+            preferred_mu=preferred_mu,
+            preferred_weight=preferred_weight,
+        )
 
     def update_beliefs(
         self,
@@ -165,50 +300,54 @@ class ActiveInferenceController:
     ) -> None:
         """Full predict-correct belief update for one controller cycle."""
         self._predict()
+        self.last_body_log_likelihood = 0.0
+        self.last_neural_log_likelihood = 0.0
         self._correct_body(mujoco_obs)
         if spike_posterior is not None:
             self._correct_odor(spike_posterior)
+        self.last_total_log_likelihood = (
+            self.last_body_log_likelihood + self.last_neural_log_likelihood
+        )
         self._update_task_state()
 
     def _predict(self) -> None:
-        self.body_state.sigma = np.sqrt(
-            self.body_state.sigma ** 2 + self._PROCESS_NOISE ** 2
+        predicted = self.transition_model.predict(
+            belief=StateBelief(
+                mu=self.body_state.mu.copy(),
+                sigma=self.body_state.sigma.copy(),
+            ),
+            action=self._last_motor,
+            dt=self._CTRL_DT_S,
         )
+        self.predictive_prior = predicted.copy()
+        self.body_state.mu = predicted.mu.copy()
+        self.body_state.sigma = predicted.sigma.copy()
 
     def _correct_body(self, obs: dict) -> None:
-        obs_indices = {
-            IDX_X: obs.get("x", None),
-            IDX_Y: obs.get("y", None),
-            IDX_THETA: obs.get("theta", None),
-            IDX_D_OBS: obs.get("d_obs", None),
-            IDX_D_FOOD: obs.get("d_food", None),
-            IDX_WX: obs.get("w_x", None),
-            IDX_WY: obs.get("w_y", None),
-        }
-
-        for idx, val in obs_indices.items():
-            if val is None or self._OBS_NOISE_BODY[idx] == 0.0:
-                continue
-            prior_var = self.body_state.sigma[idx] ** 2
-            obs_var = self._OBS_NOISE_BODY[idx] ** 2
-            gain = prior_var / (prior_var + obs_var)
-            self.body_state.mu[idx] += gain * (float(val) - self.body_state.mu[idx])
-            self.body_state.sigma[idx] = np.sqrt(max((1.0 - gain) * prior_var, 1e-6))
+        self.last_body_log_likelihood = self.observation_model.body_log_likelihood(
+            obs=obs,
+            state_mu=self.body_state.mu,
+        )
+        mu, sigma = self.observation_model.correct_body(
+            state_mu=self.body_state.mu,
+            state_sigma=self.body_state.sigma,
+            obs=obs,
+        )
+        self.body_state.mu = mu
+        self.body_state.sigma = sigma
 
     def _correct_odor(self, spike_posterior: OdorPosterior) -> None:
-        odor_indices = [IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C]
-        for j, idx in enumerate(odor_indices):
-            prior_var = self.body_state.sigma[idx] ** 2
-            obs_var = max(float(spike_posterior.sigma[j]) ** 2, 1e-6)
-            gain = prior_var / (prior_var + obs_var)
-            self.body_state.mu[idx] += gain * (
-                float(spike_posterior.mean[j]) - self.body_state.mu[idx]
-            )
-            self.body_state.sigma[idx] = np.sqrt(max((1.0 - gain) * prior_var, 1e-6))
-
-        self.body_state.mu[IDX_DELTA_C] = (
-            self.body_state.mu[IDX_C_LEFT] - self.body_state.mu[IDX_C_RIGHT]
+        self.last_neural_log_likelihood = self.observation_model.odor_log_likelihood(
+            spike_posterior=spike_posterior,
+            state_mu=self.body_state.mu,
         )
+        mu, sigma = self.observation_model.correct_odor(
+            state_mu=self.body_state.mu,
+            state_sigma=self.body_state.sigma,
+            spike_posterior=spike_posterior,
+        )
+        self.body_state.mu = mu
+        self.body_state.sigma = sigma
 
     def _mode_log_potentials(self) -> np.ndarray:
         mu = self.body_state.mu
