@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- MuJoCo arena for Drosophila odor-plume navigation (Phase 1b) -->
+<!-- TODO Phase 1b: replace placeholder geometry with calibrated arena dimensions -->
+<mujoco model="fly_arena">
+  <option timestep="0.002" gravity="0 0 -9.81"/>
+
+  <worldbody>
+    <!-- Arena floor -->
+    <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 0"
+          rgba="0.8 0.8 0.8 1" conaffinity="1" condim="3"/>
+
+    <!-- Wind-tunnel walls (placeholder) -->
+    <geom name="wall_upwind"   type="box" size="0.01 1.0 0.5" pos="-1.0 0 0.5"
+          rgba="0.5 0.5 0.9 0.3" conaffinity="0"/>
+    <geom name="wall_downwind" type="box" size="0.01 1.0 0.5" pos=" 1.0 0 0.5"
+          rgba="0.5 0.5 0.9 0.3" conaffinity="0"/>
+
+    <!-- Odor source marker (visual only) -->
+    <geom name="source" type="sphere" size="0.01" pos="0.5 0 0.02"
+          rgba="1 0.2 0 1" conaffinity="0"/>
+
+    <!-- Fly body will be included here via flybody MJCF include (Phase 3c) -->
+    <!-- <include file="../flybody/fruitfly/assets/fruitfly.xml"/> -->
+
+  </worldbody>
+
+  <sensor>
+    <!-- Placeholder antennae sensors — positions to be updated after flybody import -->
+    <framepos name="antenna_left"  objtype="site" objname="antenna_left_site"/>
+    <framepos name="antenna_right" objtype="site" objname="antenna_right_site"/>
+  </sensor>
+</mujoco>

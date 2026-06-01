@@ -1,0 +1,223 @@
+"""
+Level 3 Controller — EFE Policy Selection (Phase 3b/3c)
+Selects the walking mode π* that minimises Expected Free Energy every 20 ms.
+
+G(π) = KL[q(s²|π) ‖ p(s²)]            ← pragmatic: approach food, avoid obstacles
+     - E_q[log p(o_neural | s², π)]    ← epistemic: reduce odor uncertainty
+
+Behavioral modes: SURGE | CAST | AVOID | STOP
+Walking primitives replace the previous flight-oriented vocabulary.
+
+Motor command dict keys:
+  forward_speed  — normalised [0, 1]
+  yaw_rate       — rad/s, positive = turn left
+  sidestep       — lateral speed, normalised [−1, 1]
+  active         — bool, False triggers STOP behaviour in flybody
+
+Biological motivation: the four modes mirror identified Drosophila walking
+behaviors during plume tracking (Álvarez-Salvado et al. 2018; Demir et al. 2020):
+SURGE (~straight runs), CAST (~casting sweeps), STOP (~feeder approach halt).
+AVOID maps onto obstacle-avoidance turning observed in free-walking flies.
+"""
+from __future__ import annotations
+
+from enum import IntEnum
+
+import numpy as np
+
+from .active_inference import (
+    ActiveInferenceController,
+    BehavioralMode,
+    IDX_C_LEFT,
+    IDX_C_RIGHT,
+    IDX_D_FOOD,
+    IDX_D_OBS,
+    IDX_DELTA_C,
+    IDX_THETA,
+    _D_OBS_CLOSE,
+    _D_FOOD_STOP,
+    _ODOR_HIGH,
+)
+
+
+# ── Preferred Level 2 state priors p(s²) ────────────────────────────────────
+# Used in the pragmatic KL term: agent prefers states with high odor and low
+# obstacle/food distance.
+_PREF_FOOD_DIST    = 0.0    # want to reach food
+_PREF_OBS_DIST     = 0.3    # prefer to be away from obstacles
+_PREF_ODOR         = 0.8    # prefer high odor concentration
+
+# Weights for each dimension in the KL approximation
+_PREF_WEIGHT = np.array([
+    0.0,   # x — no absolute position preference
+    0.0,   # y
+    0.0,   # theta
+    1.0,   # c_left   — prefer high odor
+    1.0,   # c_right
+    0.5,   # delta_c  — prefer symmetric (near 0) unless casting
+    0.0,   # w_x
+    0.0,   # w_y
+    2.0,   # d_obs    — strong preference for distance from obstacles
+    3.0,   # d_food   — strongest preference for approaching food
+])
+
+
+def _pragmatic_cost(
+    mu_predicted: np.ndarray,
+    sigma_predicted: np.ndarray,
+    mode: BehavioralMode,
+) -> float:
+    """
+    Weighted squared deviation of predicted state from preferred state.
+    Lower = more pragmatically preferred.
+    Mode-specific preferred states capture different sub-goals.
+    """
+    pref = np.zeros(len(mu_predicted))
+    pref[IDX_C_LEFT]  = _PREF_ODOR
+    pref[IDX_C_RIGHT] = _PREF_ODOR
+    pref[IDX_D_OBS]   = _PREF_OBS_DIST
+    pref[IDX_D_FOOD]  = _PREF_FOOD_DIST
+
+    if mode == BehavioralMode.SURGE:
+        # SURGE: move toward food, tolerate asymmetric odor
+        pass
+    elif mode == BehavioralMode.CAST:
+        # CAST: reduce uncertainty — prefer a state with larger delta_c
+        pref[IDX_DELTA_C] = 0.3  # some asymmetry expected during casting
+    elif mode == BehavioralMode.AVOID:
+        # AVOID: strongly prefer being away from obstacles
+        pref[IDX_D_OBS] = _PREF_OBS_DIST * 2.0
+    elif mode == BehavioralMode.STOP:
+        # STOP: food distance near zero, odor high
+        pref[IDX_D_FOOD] = 0.0
+
+    sq_dev = _PREF_WEIGHT * (mu_predicted - pref) ** 2
+    return float(np.sum(sq_dev))
+
+
+def _epistemic_value(sigma: np.ndarray, mode: BehavioralMode) -> float:
+    """
+    Epistemic value: prefer actions that reduce uncertainty.
+    Approximated as negative total uncertainty on odor-related dimensions.
+    CAST gets a bonus because lateral search reduces plume-direction uncertainty.
+    """
+    odor_uncertainty = float(np.sum(sigma[[IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C]]))
+    bonus = 0.5 if mode == BehavioralMode.CAST else 0.0
+    return -(odor_uncertainty - bonus)  # negative: lower uncertainty is better
+
+
+def _predict_state(
+    controller: ActiveInferenceController,
+    mode: BehavioralMode,
+    dt: float = 0.02,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    One-step prediction of mu and sigma under a given mode's typical action.
+    Uses simplified kinematic model: heading-aligned forward/lateral displacement.
+    Returns (mu_pred, sigma_pred).
+    """
+    mu = controller.body_state.mu.copy()
+    sigma = controller.body_state.sigma.copy()
+    theta = float(mu[IDX_THETA])
+
+    # Typical forward speeds per mode (m/s)
+    _SPEED = {
+        BehavioralMode.SURGE: 0.008,
+        BehavioralMode.CAST:  0.004,
+        BehavioralMode.AVOID: 0.005,
+        BehavioralMode.STOP:  0.0,
+    }
+    # Typical yaw rates (rad/s)
+    _YAW = {
+        BehavioralMode.SURGE: 0.0,
+        BehavioralMode.CAST:  2.0,    # lateral sweep
+        BehavioralMode.AVOID: 3.0,    # turning away from obstacle
+        BehavioralMode.STOP:  0.0,
+    }
+
+    speed = _SPEED[mode]
+    mu[0] += speed * np.cos(theta) * dt     # x
+    mu[1] += speed * np.sin(theta) * dt     # y
+    mu[IDX_THETA] += _YAW[mode] * dt
+
+    # Inflate sigma with process noise (same as controller predict step)
+    sigma = np.sqrt(sigma ** 2 + (controller._PROCESS_NOISE * dt / 0.02) ** 2)
+
+    return mu, sigma
+
+
+def expected_free_energy(
+    mode: BehavioralMode,
+    controller: ActiveInferenceController,
+) -> float:
+    """
+    Compute G(π) for a single behavioral mode under current beliefs.
+
+    G = pragmatic_cost(predicted_state) - epistemic_value(predicted_uncertainty)
+
+    Lower G → more preferred mode.
+    """
+    mu_pred, sigma_pred = _predict_state(controller, mode)
+    pragmatic = _pragmatic_cost(mu_pred, sigma_pred, mode)
+    epistemic = _epistemic_value(sigma_pred, mode)
+    return pragmatic + epistemic  # epistemic already negative when uncertainty low
+
+
+def select_action(controller: ActiveInferenceController) -> BehavioralMode:
+    """
+    Evaluate G for all four modes and return the mode with minimum EFE.
+    Hard-override: AVOID takes priority when obstacle is very close.
+    """
+    d_obs  = controller.body_state.d_obs
+    d_food = controller.body_state.d_food
+    c_avg  = 0.5 * (controller.body_state.c_left + controller.body_state.c_right)
+
+    # Hard priority overrides (safety constraints)
+    if d_obs < _D_OBS_CLOSE * 0.5:
+        return BehavioralMode.AVOID
+    if d_food < _D_FOOD_STOP and c_avg > 0.3:
+        return BehavioralMode.STOP
+
+    g_values = {
+        mode: expected_free_energy(mode, controller)
+        for mode in BehavioralMode
+    }
+    return min(g_values, key=lambda m: g_values[m])
+
+
+def mode_to_motor_command(mode: BehavioralMode, controller: ActiveInferenceController) -> dict:
+    """
+    Map a discrete behavioral mode to a walking motor command dict.
+
+    The command is interpreted by the closed-loop runner to drive flybody
+    leg actuators. Keys:
+      forward_speed : [0, 1]  normalised forward walking speed
+      yaw_rate      : rad/s   positive = left turn
+      sidestep      : [-1, 1] lateral stepping speed
+      active        : bool    False = halt all stepping (STOP mode)
+
+    Yaw direction for CAST and AVOID is determined from current belief:
+      CAST → turn toward higher odor antenna
+      AVOID → turn away from nearest obstacle (heuristic: yaw +/-90°)
+    """
+    delta_c = controller.body_state.delta_c   # positive → left antenna higher
+    d_obs   = controller.body_state.d_obs
+
+    if mode == BehavioralMode.SURGE:
+        return {"forward_speed": 1.0, "yaw_rate": 0.0, "sidestep": 0.0, "active": True}
+
+    elif mode == BehavioralMode.CAST:
+        # Turn toward the side with higher odor to re-acquire the plume
+        yaw = 2.0 if delta_c > 0 else -2.0
+        return {"forward_speed": 0.3, "yaw_rate": yaw, "sidestep": 0.0, "active": True}
+
+    elif mode == BehavioralMode.AVOID:
+        # Sidestep away + yaw away from obstacle; direction is ambiguous without
+        # full obstacle geometry so we use a fixed rightward escape heuristic
+        return {"forward_speed": 0.0, "yaw_rate": -3.0, "sidestep": -0.5, "active": True}
+
+    elif mode == BehavioralMode.STOP:
+        return {"forward_speed": 0.0, "yaw_rate": 0.0, "sidestep": 0.0, "active": False}
+
+    # Fallback (should never reach here)
+    return {"forward_speed": 0.0, "yaw_rate": 0.0, "sidestep": 0.0, "active": False}

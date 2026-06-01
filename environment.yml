@@ -1,0 +1,41 @@
+name: flytwin
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - setuptools
+  - wheel
+  - git
+  # Scientific computing
+  - numpy
+  - scipy
+  - matplotlib
+  - pandas
+  - seaborn
+  - statsmodels
+  - scikit-learn
+  - h5py
+  - tqdm
+  - brian2
+  - numba
+  # Jupyter
+  - jupyter
+  - ipykernel
+  - pip:
+      # Keep PyPI as the default index while allowing CPU torch wheels.
+      - --extra-index-url https://download.pytorch.org/whl/cpu
+      # Neural simulation and connectome access
+      - neuprint-python
+      # Deep learning (CPU; replace with CUDA build if GPU available)
+      - torch
+      - torchvision
+      - torchaudio
+      # Simulation-Based Inference (NPE)
+      - sbi
+      # Body simulation
+      - mujoco
+      - dm_control
+      # Janelia fly body model
+      - git+https://github.com/TuragaLab/flybody.git
