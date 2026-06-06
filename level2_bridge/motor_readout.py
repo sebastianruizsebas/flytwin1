@@ -202,11 +202,13 @@ class MotorReadout:
         body_id_index: np.ndarray,
         B: Optional[np.ndarray] = None,
         tau_ms: float = 20.0,
+        learning_rate: float = 1e-3,
     ):
         self.pools = _pad_pools(pools)
         self.body_id_index = np.asarray(body_id_index, dtype=np.int64)
         self.B = B.copy() if B is not None else _B_DEFAULT.copy()
         self.tau_ms = float(tau_ms)
+        self.learning_rate = float(learning_rate)
 
         # Build per-pool index arrays into the global spike vector once
         id_to_pos: Dict[int, int] = {
@@ -222,6 +224,8 @@ class MotorReadout:
 
         # Low-pass filter state
         self._r_smoothed = np.zeros(N_POOLS)
+        # Last z_t cached for B adaptation
+        self._last_z: Optional[np.ndarray] = None
 
     # ── Public interface ─────────────────────────────────────────────────────
 
@@ -249,6 +253,7 @@ class MotorReadout:
         self._r_smoothed = (1.0 - alpha) * self._r_smoothed + alpha * r_raw
 
         z = self.B @ self._r_smoothed
+        self._last_z = z.copy()
         command = _z_to_command(z)
         mode = _infer_mode(z)
 
@@ -258,6 +263,40 @@ class MotorReadout:
             command=command,
             mode=mode,
         )
+
+    def adapt_from_error(self, position_error: np.ndarray) -> None:
+        """
+        Online adaptation of the B matrix from local positional error.
+
+        Biological rationale: spinal / VNC circuits refine the mapping from
+        motoneuron pool activity to locomotor output through error-driven
+        Hebbian plasticity.  Here we implement a simple gradient step:
+
+            ΔB = -η * error_outer(position_error, r_smoothed)
+
+        where position_error = [Δforward, Δyaw, Δsidestep, Δstop] is the
+        signed discrepancy between the intended and observed movement
+        (computed externally from body-state deltas), and r_smoothed is the
+        current pool firing rate vector.
+
+        The outer product maps each pool's contribution to each command axis
+        according to the observed error, tightening columns of B that
+        mispredicted the outcome.  The anatomical sign constraints encoded in
+        _B_DEFAULT are softly preserved by clipping.
+
+        Parameters
+        ----------
+        position_error : (4,) array — [forward_err, yaw_err, sidestep_err,
+            stop_err].  Positive = body moved less than commanded.
+        """
+        if self._last_z is None or self.learning_rate == 0.0:
+            return
+        error = np.asarray(position_error, dtype=float)
+        # Gradient of MSE loss: dL/dB = error ⊗ r (outer product)
+        dB = np.outer(error, self._r_smoothed)
+        self.B -= self.learning_rate * dB
+        # Clip to [-2, 2] to prevent runaway weights
+        np.clip(self.B, -2.0, 2.0, out=self.B)
 
     def raw_pool_rates(
         self, spike_window: np.ndarray, dt_ms: float
@@ -270,8 +309,9 @@ class MotorReadout:
         return {p.name: p.size for p in self.pools}
 
     def reset(self) -> None:
-        """Reset the low-pass filter state."""
+        """Reset the low-pass filter state and cached z."""
         self._r_smoothed[:] = 0.0
+        self._last_z = None
 
     # ── Internal ─────────────────────────────────────────────────────────────
 

@@ -37,12 +37,16 @@ from enum import IntEnum
 
 import numpy as np
 
+from pymdp.agent import Agent
+
 from level2_bridge.ppglm import OdorPosterior
 from .generative_model import (
     ObservationModel,
     PreferredOutcomeModel,
     StateBelief,
     TransitionModel,
+    build_pymdp_matrices,
+    calibrate_pymdp_A_from_data,
 )
 
 
@@ -70,6 +74,16 @@ STATE_DIM = 10
 _ODOR_HIGH = 0.5
 _D_OBS_CLOSE = 0.15
 _D_FOOD_STOP = 0.05
+
+# Thresholds for discretising the Level 2 continuous belief into the
+# categorical observation indices expected by the Level 3 pymdp agent.
+_OBS_ODOR_MED_THRESH  = 0.3   # c_avg below → LOW, above → MED or HIGH
+_OBS_ODOR_HIGH_THRESH = 0.6   # c_avg above → HIGH
+_OBS_GRADIENT_THRESH  = 0.10  # |delta_c| below → BALANCED
+_OBS_OBS_NEAR_THRESH  = 0.30  # d_obs below → NEAR
+_OBS_OBS_CLOSE_THRESH = 0.15  # d_obs below → CLOSE
+_OBS_FOOD_NEAR_THRESH = 0.20  # d_food below → NEAR
+_OBS_FOOD_AT_THRESH   = 0.05  # d_food below → AT
 
 
 @dataclass
@@ -183,7 +197,8 @@ class ActiveInferenceController:
         0.005,
     ])
 
-    def __init__(self, initial_obs: dict | None = None):
+    def __init__(self, initial_obs: dict | None = None,
+                 h5_path: "Path | None" = None):
         self.initial_state_prior = self._build_initial_state_prior(initial_obs)
         self.predictive_prior = self.initial_state_prior.copy()
         self.body_state = BodyEnvState(
@@ -211,6 +226,10 @@ class ActiveInferenceController:
         self.last_body_log_likelihood = 0.0
         self.last_neural_log_likelihood = 0.0
         self.last_total_log_likelihood = 0.0
+        self.pymdp_agent: Agent = self._build_pymdp_agent(h5_path=h5_path)
+        # Cached index of the action recommended by the pymdp policy posterior.
+        # Initialised to SURGE (0) as the default exploratory prior.
+        self._pymdp_action_idx: int = int(BehavioralMode.SURGE)
 
     def set_last_motor(self, motor_command: dict | None) -> None:
         """
@@ -280,13 +299,14 @@ class ActiveInferenceController:
             0.0,
             0.0,
             0.0,
-            1.0,
-            1.0,
-            0.5,
+            1.0,   # c_left
+            1.0,   # c_right
+            0.5,   # delta_c
             0.0,
             0.0,
-            2.0,
-            3.0,
+            0.0,   # d_obs: zeroed until MuJoCo contact sensors are live;
+                   # frozen at 1.0 otherwise biases EFE toward AVOID permanently
+            3.0,   # d_food
         ])
         return PreferredOutcomeModel(
             preferred_mu=preferred_mu,
@@ -349,24 +369,95 @@ class ActiveInferenceController:
         self.body_state.mu = mu
         self.body_state.sigma = sigma
 
-    def _mode_log_potentials(self) -> np.ndarray:
-        mu = self.body_state.mu
-        sigma = self.body_state.sigma
-        c_avg = 0.5 * (mu[IDX_C_LEFT] + mu[IDX_C_RIGHT])
-        odor_uncertainty = float(np.sum(sigma[[IDX_C_LEFT, IDX_C_RIGHT, IDX_DELTA_C]]))
-        gradient_strength = abs(mu[IDX_DELTA_C])
-        d_obs = mu[IDX_D_OBS]
-        d_food = mu[IDX_D_FOOD]
+    @classmethod
+    def _build_pymdp_agent(cls, h5_path: "Path | None" = None) -> Agent:
+        """
+        Instantiate the Level 3 pymdp discrete active inference agent.
 
-        return np.array([
-            2.5 * c_avg - 1.5 * d_food - 0.5 * odor_uncertainty,
-            1.5 * odor_uncertainty + 0.5 * gradient_strength - c_avg,
-            10.0 * max(0.0, _D_OBS_CLOSE - d_obs) - 0.5 * c_avg,
-            8.0 * max(0.0, _D_FOOD_STOP - d_food) + 2.0 * c_avg - 0.5 * odor_uncertainty,
-        ])
+        When h5_path points to a completed training_data.h5 the A matrices
+        are calibrated via empirical Bayes (calibrate_pymdp_A_from_data);
+        otherwise the hard-coded fallback matrices are used.
+
+        Theoretical role: A encodes P(obs|mode) — the generative model's
+        claim about which sensory observations predict each behavioral mode.
+        Grounding A in data makes the agent's predictions falsifiable.
+        """
+        A_cal = None
+        if h5_path is not None:
+            from pathlib import Path as _Path
+            _p = _Path(h5_path)
+            if _p.exists():
+                try:
+                    A_cal = calibrate_pymdp_A_from_data(_p)
+                    import logging as _logging
+                    _logging.getLogger(__name__).info(
+                        "pymdp A matrices calibrated from %s", _p
+                    )
+                except Exception as exc:
+                    import warnings
+                    warnings.warn(
+                        f"A matrix calibration failed ({exc}); "
+                        "falling back to hard-coded matrices."
+                    )
+        A, B, C, D = build_pymdp_matrices(A_calibrated=A_cal)
+        return Agent(A=A, B=B, C=C, D=D, policy_len=1)
+
+    @staticmethod
+    def _discretize_obs(body_state: "BodyEnvState") -> list:
+        """
+        Map Level 2 continuous belief means to discrete observation indices
+        for the Level 3 pymdp agent.
+
+        Returns a 4-element list [odor_idx, gradient_idx, obstacle_idx, food_idx].
+          odor_idx     : 0=LOW  1=MED  2=HIGH
+          gradient_idx : 0=LEFT_HIGHER  1=BALANCED  2=RIGHT_HIGHER
+          obstacle_idx : 0=CLEAR  1=NEAR  2=CLOSE
+          food_idx     : 0=FAR  1=NEAR  2=AT
+        """
+        c_avg = 0.5 * (body_state.c_left + body_state.c_right)
+        odor_idx = (
+            0 if c_avg < _OBS_ODOR_MED_THRESH else
+            (1 if c_avg < _OBS_ODOR_HIGH_THRESH else 2)
+        )
+
+        delta_c = body_state.delta_c
+        if delta_c > _OBS_GRADIENT_THRESH:
+            gradient_idx = 0  # left antenna higher
+        elif delta_c < -_OBS_GRADIENT_THRESH:
+            gradient_idx = 2  # right antenna higher
+        else:
+            gradient_idx = 1  # balanced
+
+        d_obs = body_state.d_obs
+        obstacle_idx = (
+            0 if d_obs > _OBS_OBS_NEAR_THRESH else
+            (1 if d_obs > _OBS_OBS_CLOSE_THRESH else 2)
+        )
+
+        d_food = body_state.d_food
+        food_idx = (
+            2 if d_food < _OBS_FOOD_AT_THRESH else
+            (1 if d_food < _OBS_FOOD_NEAR_THRESH else 0)
+        )
+
+        return [odor_idx, gradient_idx, obstacle_idx, food_idx]
 
     def _update_task_state(self) -> None:
-        scores = self._mode_log_potentials()
-        scores = scores - scores.max()
-        exp_scores = np.exp(scores)
-        self.task_state.probs = exp_scores / exp_scores.sum()
+        """
+        Update Level 3 discrete belief using pymdp variational message passing.
+
+        1. Discretise the current Level 2 continuous belief means into the four
+           categorical observation indices expected by the pymdp agent.
+        2. Run one step of variational state inference (infer_states).
+        3. Run policy inference / EFE computation (infer_policies).
+        4. Cache the argmax action for use by policy.select_action().
+        5. Mirror the pymdp hidden-state posterior into TaskState.probs so that
+           existing logging / diagnostic code continues to work unchanged.
+        """
+        obs = self._discretize_obs(self.body_state)
+        self.pymdp_agent.infer_states(obs)
+        self.pymdp_agent.infer_policies()
+        self.task_state.probs = np.asarray(
+            self.pymdp_agent.qs[0], dtype=float
+        ).copy()
+        self._pymdp_action_idx = int(np.argmax(self.pymdp_agent.q_pi))

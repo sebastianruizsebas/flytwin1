@@ -24,14 +24,22 @@ dependencies:
   - jupyter
   - ipykernel
   - pip:
-      # Keep PyPI as the default index while allowing CPU torch wheels.
-      - --extra-index-url https://download.pytorch.org/whl/cpu
+      # ── GPU wheels (install AFTER conda env create + activate) ──────────
+      # PyTorch CUDA 13.2 — use cu132 for CUDA 13.2:
+      #   pip install --index-url https://download.pytorch.org/whl/cu132 torch torchvision torchaudio
+      # JAX CUDA 13 + cuDNN:
+      #   pip install --upgrade "jax[cuda13_cudnn]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      # brian2cuda (GPU Brian2, Linux only, requires CUDA 13 + cmake):
+      #   pip install brian2cuda  # Linux only — do NOT install on Windows/macOS
+      # CPU fallbacks (no NVIDIA GPU):
+      #   pip install torch torchvision torchaudio   # default PyPI index = CPU
+      #   pip install "jax[cpu]"
+      # ────────────────────────────────────────────────────────────────────
+      # Active Inference discrete POMDP controller (Level 3)
+      # Use 0.0.7.1 — the 1.x API is incompatible (Agent expects obj_array not list)
+      - inferactively-pymdp==0.0.7.1
       # Neural simulation and connectome access
       - neuprint-python
-      # Deep learning (CPU; replace with CUDA build if GPU available)
-      - torch
-      - torchvision
-      - torchaudio
       # Simulation-Based Inference (NPE)
       - sbi
       # Body simulation
@@ -39,10 +47,3 @@ dependencies:
       - dm_control
       # Janelia fly body model
       - git+https://github.com/TuragaLab/flybody.git
-      # ── GPU / JAX acceleration ──────────────────────────────────────────
-      # GPU (CUDA 12): install this on Linux/Windows with CUDA 12 toolkit.
-      # Replace with 'jax[cpu]' if no NVIDIA GPU is available.
-      - jax[cuda12]
-      # brian2cuda enables GPU-based Brian2 sims (requires CUDA 12 + cmake):
-      #   pip install brian2cuda
-      # (commented out because it requires a separate build step)

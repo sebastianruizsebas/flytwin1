@@ -54,6 +54,68 @@ yet assembled into a full generative active inference loop.
 
 ---
 
+## Discrete vs. Continuous Space: Design Decision for Level 3
+
+### Decision
+
+The Level 3 behavioral-mode controller uses a **discrete state space** implemented
+with the `pymdp` library (a Python Active Inference toolbox for discrete POMDPs).
+The Level 2 sensory-motor state tracker retains a **continuous** diagonal-Gaussian
+representation.
+
+### Rationale for discrete Level 3
+
+| Consideration | Why discrete wins at Level 3 |
+|---|---|
+| **Ethological grounding** | Drosophila navigation is characterised by a small, well-defined repertoire of motor patterns — SURGE, CAST, AVOID, STOP — not a continuum of hidden states. Categorical modes match the biology. |
+| **pymdp compatibility** | `pymdp` implements variational message passing for discrete POMDPs and provides a principled, tested EFE computation, policy posterior `q(π)`, and action sampling out of the box. Re-implementing this from scratch introduces unnecessary error surface. |
+| **Combinatorial policy space** | With 4 modes × horizon 1, the policy space is trivially enumerable. Discrete inference is exact and cheap (< 1 ms) within the 20 ms control budget. |
+| **Principled prior preferences** | The `C` vector (log preference over discrete observations) provides a clean, auditable way to encode ethological goals (odor contact, obstacle avoidance, feeder approach) without embedding them inside the filtering prior. |
+| **Belief updates are separable** | The categorical mode posterior is updated by discretising the Level 2 continuous belief means into 4 observation modalities; the coupling is deliberate and one-directional (Level 2 → Level 3). |
+
+### Rationale for continuous Level 2
+
+| Consideration | Why continuous stays at Level 2 |
+|---|---|
+| **High-dimensional precision** | Pose `(x, y, θ)`, bilateral odor concentrations, wind, and proximity distances are real-valued and benefit from sub-centimetre tracking precision that a coarse discrete grid would destroy. |
+| **Kalman-style closed-form updates** | Diagonal-Gaussian predict-correct cycles are analytically exact for linear-Gaussian state transitions and observation models. They are computationally trivial for the 10D state. |
+| **pymdp does not support continuous variables** | `pymdp` is explicitly designed for discrete POMDPs. Forcing continuous state into pymdp would require either a coarse discretisation (information loss) or a Gaussian-mixture extension that is not yet in the library. |
+| **Odor likelihood bridge** | The PP-GLM (Level 2 bridge) produces a Gaussian posterior over `[c_left, c_right, Δc]`. Fusing this into a continuous belief with a Kalman gain is the natural and lowest-noise option. |
+
+### Architecture summary
+
+```
+Level 1  spike trains  ──────────────────────────────►  PP-GLM posterior
+                                                              │
+Level 2  10D diagonal-Gaussian belief  ◄──  predict-correct  │
+         [x, y, θ, c_L, c_R, Δc, w_x, w_y, d_obs, d_food]   │
+                          │                                   │
+                  discretise (4 obs modalities)               │
+                          │                                   │
+Level 3  pymdp Agent  ◄───┘                                   │
+         hidden: {SURGE, CAST, AVOID, STOP}                   │
+         A, B, C, D matrices                                  │
+         infer_states → infer_policies → argmax(q_π)          │
+                          │                                   │
+                  select_action()  ◄── hard overrides ────────┘
+                          │
+                  motor command → flybody plant
+```
+
+### What would tip the balance toward a continuous Level 3?
+
+- If the controller needed to represent _continuous_ uncertainty over locomotor
+  speed or heading as hidden variables (not just discrete modes), a Gaussian or
+  particle-filter formulation would be appropriate.
+- If future work adds a planning horizon > 1, continuous-state EFE (e.g. via
+  JAX-based rollouts) could be more efficient than an exponentially large
+  discrete policy tree.
+- If the number of modes grows substantially (> ~16), discrete exact inference
+  becomes expensive and an approximation scheme (e.g. amortised inference) would
+  be needed regardless of pymdp.
+
+---
+
 ## Implementation Philosophy
 
 The correct first implementation is **approximate active inference**, not a full

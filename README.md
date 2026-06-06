@@ -141,18 +141,27 @@ python generate_training_data.py \
     --g-cal 1.0
 ```
 
-**Full research sweep** (finer conductance grid, longer trials):
+**Full research sweep** (finer conductance grid, longer trials, biologically constrained):
 
 ```bash
 python generate_training_data.py \
     --n-positions 12 \
     --n-trials    50 \
     --trial-ms    10000 \
-    --g-ka  0.1 0.25 0.5 0.75 1.0 1.25 1.5 1.75 2.0 \
-    --g-na  0.6 0.8 1.0 1.2 1.4 \
-    --g-cal 0.25 0.5 1.0 1.5 2.0 \
+    --g-ka  0.25 0.5 0.75 1.0 1.25 1.5 2.0 \
+    --g-na  0.75 0.875 1.0 1.125 1.25 \
+    --g-cal 0.5 0.75 1.0 1.5 2.0 \
     --lam   0.5
 ```
+
+**Biological justification for conductance bounds** (Drosophila antennal lobe projection neurons,
+Nagel & Wilson 2011; Wilson & Laurent 2005):
+
+| Parameter | Nominal | Min scale | Max scale | Rationale |
+|-----------|---------|-----------|-----------|-----------|
+| `g_KA` (A-type K⁺, Shal/Kv4) | ~5 mS/cm² | **0.25×** | **2.0×** | Below 0.25× the transient repolarisation is lost and spike trains become tonic/pathological. Above 2× matches the highest measured Shal expression in identified PNs. Removing the 0.1× value from the old sweep avoids a near-complete knock-out that is not seen in healthy flies. |
+| `g_Na` (fast Na⁺, para/NaV1) | ~120 mS/cm² | **0.75×** | **1.25×** | Below 0.75× (90 mS/cm²) spike initiation fails intermittently under the plume-drive currents used here (~6–10 µA/cm²). Above 1.25× (150 mS/cm²) generates high-frequency burst artefacts not observed in whole-cell PN recordings. ±25% covers the neuron-to-neuron variability reported in Drosophila slice data. |
+| `g_CaL` (L-type Ca²⁺, Dmca1D/Cav1) | ~2 mS/cm² | **0.5×** | **2.0×** | Below 0.5× (1 mS/cm²) the slow calcium-dependent plateau is essentially absent. The 0.25× value in the old sweep removed nearly all L-type calcium, which is inconsistent with the ubiquitous expression of Dmca1D in Drosophila PNs. |
 
 **Flags:**
 
@@ -162,9 +171,9 @@ python generate_training_data.py \
 | `--n-positions N` | `8` | Number of fly starting positions |
 | `--n-trials N` | `30` | Noise realisations per (position, condition) |
 | `--trial-ms N` | `5000` | Trial duration in ms |
-| `--g-ka SCALES…` | `0.25 0.5 1.0 1.5 2.0` | g_KA scale values |
-| `--g-na SCALES…` | `0.8 1.0 1.2` | g_Na scale values |
-| `--g-cal SCALES…` | `0.5 1.0 2.0` | g_CaL scale values |
+| `--g-ka SCALES…` | `0.25 0.5 1.0 1.5 2.0` | g_KA scale values (min 0.25× — near-absent Shal is not biologically realistic) |
+| `--g-na SCALES…` | `0.8 1.0 1.2` | g_Na scale values (keep within 0.75–1.25× for reliable spiking) |
+| `--g-cal SCALES…` | `0.5 1.0 2.0` | g_CaL scale values (min 0.5× — Dmca1D is constitutively expressed in PNs) |
 | `--lam FLOAT` | `1.0` | Trend-filter penalty strength |
 | `--seed INT` | `42` | Global RNG seed |
 | `--quiet` | off | Suppress per-condition progress |
@@ -183,12 +192,20 @@ python generate_training_data.py \
 - **Fly position** (upwind distance and lateral offset) — samples the full dynamic
   range of odor drive including plume-edge crossings that load the bilateral
   gradient column (Δc) in the design matrix.
-- **g_KA** — A-type potassium controls transient responsiveness and spike timing;
-  this is the primary conductance parameter affecting plume-tracking behavior.
-- **g_Na** — sodium conductance shifts spike threshold and gain; modulates how
-  strongly odor drive is transduced into spikes.
-- **g_CaL** — L-type calcium adds slower depolarising dynamics and affects burst
-  statistics relevant to the SURGE/CAST mode boundary.
+- **g_KA** (A-type potassium, Shal/Kv4 family) — controls transient repolarisation, spike
+  timing, and adaptation. Sweeps from 0.25–2.0× the nominal 5 mS/cm², covering the range of
+  Shal expression measured across identified *Drosophila* PNs. The lower bound (0.25×)
+  preserves a small but measurable transient K⁺ current; removing it entirely (0.1×) produces
+  non-biological runaway firing.
+- **g_Na** (fast sodium, para/NaV1) — sets spike threshold and gain. Sweeps 0.75–1.25× the
+  nominal 120 mS/cm². Below 0.75× (90 mS/cm²) spike initiation becomes unreliable under
+  physiological drive currents; above 1.25× (150 mS/cm²) generates high-frequency burst
+  artefacts not seen in whole-cell *Drosophila* PN recordings (Nagel & Wilson 2011).
+- **g_CaL** (L-type calcium, Dmca1D/Cav1) — adds slower depolarising dynamics and shapes
+  burst statistics. Sweeps 0.5–2.0× the nominal 2 mS/cm². The 0.5× lower bound preserves
+  the calcium-dependent plateau that is functionally important for SURGE/CAST mode transitions;
+  0.25× (the previous minimum) was sub-physiological given the ubiquitous Dmca1D expression
+  in *Drosophila* projection neurons.
 
 ---
 
@@ -255,12 +272,13 @@ python run_closed_loop.py \
     --swc data/connectome/skeletons/<bodyId>.swc
 ```
 
-**With HDF5 logging and a fitted beta vector:**
+**With HDF5 logging, a fitted beta vector, and data-grounded A matrix:**
 
 ```bash
 python run_closed_loop.py \
     --swc  data/connectome/skeletons/<bodyId>.swc \
     --beta data/spikes/beta.npy \
+    --h5   data/spikes/training_data.h5 \
     --log  data/spikes/run_001.h5 \
     --duration 120000
 ```
@@ -272,6 +290,7 @@ python run_closed_loop.py \
 | `--swc PATH` | *(required)* | SWC skeleton file for the compartmental HH neuron |
 | `--duration MS` | `60000` | Simulation duration in milliseconds |
 | `--beta PATH` | `None` | Pre-fitted `.npy` PP-GLM beta vector (24-dim) |
+| `--h5 PATH` | `None` | `training_data.h5` — calibrates pymdp A matrices from data via empirical Bayes.  Recommended: `data/spikes/training_data.h5` |
 | `--log PATH` | `None` | HDF5 output file for full state/spike log |
 | `--quiet` | off | Suppress per-ms progress output |
 

@@ -16,9 +16,11 @@ making both likelihood and transition structure explicit and inspectable.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
+from pymdp import utils as pymdp_utils
 
 from level2_bridge.ppglm import (
     OdorPosterior,
@@ -305,3 +307,250 @@ class ObservationModel:
             wind_angle_window=wind_angle_window,
             candidate_odor_state=candidate_odor_state,
         )
+
+
+def calibrate_pymdp_A_from_data(
+    h5_path: Path,
+    concentration_prior: float = 1.0,
+) -> list[np.ndarray]:
+    """
+    Derive pymdp A matrices (likelihood P(obs|mode)) from training_data.h5.
+
+    Theoretical role: empirical Bayes initialisation of the A matrix — the
+    central scientific claim of the generative model.  Each entry
+    A[obs_i, mode_j] = P(obs_i | hidden_mode_j) is estimated by counting
+    how often each discrete observation category co-occurs with each
+    inferred behavioral mode across the training sweep.
+
+    Mode inference heuristic (grounded in Drosophila plume-tracking literature,
+    Álvarez-Salvado et al. 2018; Demir et al. 2020):
+      SURGE  — on-axis, mean odor > 0.4  (upwind runs)
+      CAST   — off-axis gradient or low odor  (lateral search)
+      STOP   — d_food < 0.03 and c_avg > 0.5  (feeder approach halt)
+      AVOID  — not present in training sweep; kept at flat prior
+
+    Observation discretisation uses the same thresholds as
+    ActiveInferenceController._discretize_obs() so inference and calibration
+    are consistent at runtime.
+
+    Parameters
+    ----------
+    h5_path : Path
+        Path to training_data.h5 produced by generate_training_data.py.
+    concentration_prior : float
+        Dirichlet pseudocount added to every (obs, mode) cell before
+        normalisation.  Default 1.0 = Laplace smoothing.
+
+    Returns
+    -------
+    list of four (n_obs_states, 4) float arrays — A matrices in the same
+    order as build_pymdp_matrices(): [A_odor, A_gradient, A_obstacle, A_food].
+    """
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError(
+            "h5py is required for A matrix calibration: pip install h5py"
+        ) from exc
+
+    # Dirichlet concentration counts — shape (n_obs_states, n_modes=4)
+    # Obstacle modality has no training data; stays at flat prior.
+    pA_odor     = np.ones((3, 4), dtype=float) * concentration_prior
+    pA_gradient = np.ones((3, 4), dtype=float) * concentration_prior
+    pA_obstacle = np.ones((3, 4), dtype=float) * concentration_prior  # uniform
+    pA_food     = np.ones((3, 4), dtype=float) * concentration_prior
+
+    # Discretisation thresholds — must match _discretize_obs() in active_inference.py
+    _ODOR_MED   = 0.3
+    _ODOR_HIGH  = 0.6
+    _GRAD_THRESH = 0.10
+    _FOOD_NEAR  = 0.20
+    _FOOD_AT    = 0.05
+
+    with h5py.File(h5_path, "r") as f:
+        for pos_key in f:
+            if pos_key == "fit":
+                continue
+            # Parse position from group key: pos00_x-0.050_y0.000
+            parts = pos_key.split("_")
+            try:
+                x = float(parts[1][1:])   # strip leading 'x'
+                y = float(parts[2][1:])   # strip leading 'y'
+            except (IndexError, ValueError):
+                continue
+            d_food = float(np.hypot(x, y))  # food source at arena origin
+
+            for cond_key in f[pos_key]:
+                grp = f[pos_key][cond_key]
+                if "c_left_trace" not in grp or "c_right_trace" not in grp:
+                    continue
+
+                c_left_trace  = grp["c_left_trace"][:]
+                c_right_trace = grp["c_right_trace"][:]
+
+                c_avg   = float(0.5 * (c_left_trace.mean() + c_right_trace.mean()))
+                delta_c = float((c_left_trace - c_right_trace).mean())
+
+                # Infer ground-truth mode from position + sensory context.
+                # AVOID is excluded from training data (no obstacle conditions
+                # in the sweep), so it retains only the flat prior mass.
+                if d_food < 0.03 and c_avg > 0.5:
+                    mode = 3  # STOP
+                elif c_avg > 0.4:
+                    mode = 0  # SURGE — strong on-axis odor, near source
+                elif abs(delta_c) > 0.05 or c_avg > 0.1:
+                    mode = 1  # CAST — lateral gradient or low/intermittent odor
+                else:
+                    mode = 0  # SURGE default for upwind far-field positions
+
+                # Discretise each observation modality
+                odor_idx = 0 if c_avg < _ODOR_MED else (1 if c_avg < _ODOR_HIGH else 2)
+                grad_idx = (
+                    0 if delta_c >  _GRAD_THRESH else
+                    (2 if delta_c < -_GRAD_THRESH else 1)
+                )
+                food_idx = (
+                    2 if d_food < _FOOD_AT else
+                    (1 if d_food < _FOOD_NEAR else 0)
+                )
+
+                pA_odor[odor_idx, mode]     += 1.0
+                pA_gradient[grad_idx, mode] += 1.0
+                pA_food[food_idx, mode]     += 1.0
+
+    def _norm_cols(pA: np.ndarray) -> np.ndarray:
+        """Normalise each column to sum to 1 (valid probability distribution)."""
+        col_sums = pA.sum(axis=0, keepdims=True)
+        col_sums = np.where(col_sums == 0, 1.0, col_sums)  # guard zero columns
+        return pA / col_sums
+
+    # Convert to obj_array for pymdp 0.0.7.1 Agent compatibility
+    result = pymdp_utils.obj_array(4)
+    result[0] = _norm_cols(pA_odor)
+    result[1] = _norm_cols(pA_gradient)
+    result[2] = _norm_cols(pA_obstacle)
+    result[3] = _norm_cols(pA_food)
+    return result
+
+
+def build_pymdp_matrices(A_calibrated: list[np.ndarray] | None = None):
+    """
+    Construct A, B, C, D arrays for the Level 3 pymdp discrete agent.
+
+    Returns (A, B, C, D) ready for ``pymdp.agent.Agent(A=A, B=B, C=C, D=D)``.
+
+    Parameters
+    ----------
+    A_calibrated : list of np.ndarray or None
+        If provided, replaces the hand-coded A matrices with data-grounded
+        values from ``calibrate_pymdp_A_from_data()``.  Must be a 4-element
+        list in the order [A_odor, A_gradient, A_obstacle, A_food], each
+        shaped (n_obs_states, 4).  When None the fallback hard-coded matrices
+        are used (suitable only for quick tests without training data).
+
+    Discrete state space (Level 3 only):
+      Hidden state factor 0 — Behavioral mode:
+        SURGE(0)  CAST(1)  AVOID(2)  STOP(3)
+
+      Observation modalities:
+        0  Odor level     LOW(0)         MED(1)         HIGH(2)
+        1  Gradient dir   LEFT_HIGHER(0) BALANCED(1)    RIGHT_HIGHER(2)
+        2  Obstacle prox  CLEAR(0)       NEAR(1)        CLOSE(2)
+        3  Food proximity FAR(0)         NEAR(1)        AT(2)
+
+      Actions: 4, one per behavioral mode.
+
+    The continuous Level 2 state (10D diagonal Gaussian) is NOT represented
+    here.  The discretisation of Level 2 belief means into observation indices
+    is performed by ActiveInferenceController._discretize_obs().
+    """
+    # ------------------------------------------------------------------
+    # A matrices — P(o_m | s), shape (n_obs_states_m, n_hidden_states)
+    # Each column gives P(obs | mode=col); must sum to 1.0 along axis 0.
+    # ------------------------------------------------------------------
+
+    if A_calibrated is not None:
+        # Data-grounded path: use empirical Bayes A from training_data.h5
+        A = A_calibrated
+    else:
+        # Fallback hard-coded matrices — for quick tests only.
+        # Replace by passing A_calibrated from calibrate_pymdp_A_from_data().
+        # Modality 0: Odor level [LOW, MED, HIGH]  x  [SURGE, CAST, AVOID, STOP]
+        A_odor = np.array([
+            [0.10, 0.30, 0.60, 0.05],  # LOW
+            [0.30, 0.50, 0.30, 0.15],  # MED
+            [0.60, 0.20, 0.10, 0.80],  # HIGH
+        ], dtype=float)
+
+        # Modality 1: Gradient [LEFT_HIGHER, BALANCED, RIGHT_HIGHER]
+        A_gradient = np.array([
+            [0.20, 0.40, 0.40, 0.15],  # LEFT_HIGHER
+            [0.60, 0.20, 0.20, 0.70],  # BALANCED
+            [0.20, 0.40, 0.40, 0.15],  # RIGHT_HIGHER
+        ], dtype=float)
+
+        # Modality 2: Obstacle proximity [CLEAR, NEAR, CLOSE]
+        A_obstacle = np.array([
+            [0.70, 0.80, 0.10, 0.80],  # CLEAR
+            [0.20, 0.15, 0.40, 0.15],  # NEAR
+            [0.10, 0.05, 0.50, 0.05],  # CLOSE
+        ], dtype=float)
+
+        # Modality 3: Food proximity [FAR, NEAR, AT]
+        A_food = np.array([
+            [0.50, 0.70, 0.70, 0.05],  # FAR
+            [0.40, 0.25, 0.25, 0.15],  # NEAR
+            [0.10, 0.05, 0.05, 0.80],  # AT
+        ], dtype=float)
+
+        A = [A_odor, A_gradient, A_obstacle, A_food]
+
+    A_obj = pymdp_utils.obj_array(len(A))
+    for i, a in enumerate(A):
+        A_obj[i] = a
+
+    # ------------------------------------------------------------------
+    # B matrix — P(s' | s, a), shape (n_states, n_states, n_actions)
+    # B[s', s, a] = P(next_mode=s' | current_mode=s, action=a)
+    # Selecting action a (= a mode) drives hidden state toward that mode
+    # with probability 0.85; residual mass spreads uniformly (0.05 each).
+    # ------------------------------------------------------------------
+    n_states = 4
+    n_actions = 4
+    B_modes = np.zeros((n_states, n_states, n_actions), dtype=float)
+    for a in range(n_actions):
+        for s in range(n_states):
+            B_modes[a, s, a] = 0.85
+            for sp in range(n_states):
+                if sp != a:
+                    B_modes[sp, s, a] = 0.05
+
+    B = [B_modes]
+
+    B_obj = pymdp_utils.obj_array(1)
+    B_obj[0] = B_modes
+
+    # ------------------------------------------------------------------
+    # C vectors — log prior preferences over observations
+    # Higher values = more preferred outcomes.
+    # ------------------------------------------------------------------
+    C_odor     = np.array([-2.0,  0.0,  2.0], dtype=float)  # prefer HIGH odor
+    C_gradient = np.array([ 0.0,  1.0,  0.0], dtype=float)  # prefer BALANCED
+    C_obstacle = np.array([ 2.0, -1.0, -3.0], dtype=float)  # strongly prefer CLEAR
+    C_food     = np.array([-1.0,  1.0,  3.0], dtype=float)  # strongly prefer AT
+
+    C = [C_odor, C_gradient, C_obstacle, C_food]
+
+    C_obj = pymdp_utils.obj_array(4)
+    for i, c in enumerate(C):
+        C_obj[i] = c
+
+    # ------------------------------------------------------------------
+    # D vector — uniform prior over initial behavioral modes
+    # ------------------------------------------------------------------
+    D = [np.ones(n_states, dtype=float) / n_states]
+
+    D_obj = pymdp_utils.obj_array(1)
+    D_obj[0] = np.ones(n_states, dtype=float) / n_states
+
+    return A_obj, B_obj, C_obj, D_obj

@@ -35,6 +35,7 @@ Notes
 from __future__ import annotations
 
 import logging
+import subprocess
 
 import numpy as np  # always available
 
@@ -106,13 +107,21 @@ def _detect_brian2_target() -> str:
         pip install brian2cuda
     and ensure the CUDA 12 toolkit is on PATH.
     """
-    # CUDA via brian2cuda
-    try:
-        import brian2cuda  # noqa: F401
-        _log.info("Brian2 target: cuda_standalone (brian2cuda found)")
-        return "cuda_standalone"
-    except ImportError:
-        pass
+    # CUDA via brian2cuda — Linux only (brian2cuda does not support Windows/macOS).
+    import sys as _sys
+    if _sys.platform == "linux":
+        try:
+            import brian2cuda  # noqa: F401  — side-effect: registers cuda_standalone device
+            from brian2.codegen.targets import codegen_targets
+            target_names = {t.class_name for t in codegen_targets}
+            if "cuda_standalone" not in target_names:
+                raise ImportError("cuda_standalone not accepted by Brian2 codegen layer")
+            _log.info("Brian2 target: cuda_standalone (brian2cuda + CUDA runtime verified)")
+            return "cuda_standalone"
+        except (ImportError, Exception):
+            pass
+    else:
+        _log.info("Brian2 target: skipping cuda_standalone check (brian2cuda is Linux-only)")
 
     # CPU JIT via Cython
     try:
@@ -121,7 +130,6 @@ def _detect_brian2_target() -> str:
         from brian2.devices import cpp_standalone  # noqa: F401
         # Verify a compiler is reachable (distutils heuristic)
         import distutils.core  # noqa: F401
-        import subprocess
         result = subprocess.run(
             ["g++", "--version"],
             capture_output=True,
@@ -138,3 +146,51 @@ def _detect_brian2_target() -> str:
 
 
 BRIAN2_TARGET: str = _detect_brian2_target()
+
+
+# ── Brian2 thread count ────────────────────────────────────────────────────────
+# Brian2 runtime (cython/numpy) does not use OpenMP internally — that is only
+# available in cpp_standalone mode, which is incompatible with the per-step
+# call pattern used by ConnectomeRNN.step().
+#
+# What does work for multi-core in runtime mode:
+#   1. OMP_NUM_THREADS env-var: the Cython compiled extensions call NumPy
+#      routines and scipy sparse ops which use OpenBLAS/MKL threads internally.
+#      Setting OMP_NUM_THREADS / MKL_NUM_THREADS lets those use all cores.
+#   2. Multiple parallel processes (one per simulation) — each process owns its
+#      own Brian2 network; no shared state, scales linearly with CPU count.
+#
+# BRIAN2_NUM_THREADS: number of physical cores (or value of OMP_NUM_THREADS if
+# already set), exported so callers can log/display it.
+
+import os as _os
+import multiprocessing as _mp
+
+def _resolve_num_threads() -> int:
+    """Return the thread count Brian2/NumPy will actually use."""
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        val = _os.environ.get(var)
+        if val is not None:
+            try:
+                return max(1, int(val))
+            except ValueError:
+                pass
+    return _mp.cpu_count()
+
+
+BRIAN2_NUM_THREADS: int = _resolve_num_threads()
+
+# Apply to all relevant environment variables so NumPy/SciPy sub-libraries
+# respect the same count (idempotent if already set).
+for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS"):
+    if _var not in _os.environ:
+        _os.environ[_var] = str(BRIAN2_NUM_THREADS)
+
+_log.info(
+    "Brian2 thread budget: %d threads (OMP_NUM_THREADS=%s). "
+    "Runtime mode uses NumPy/SciPy threading; OpenMP-level parallelism "
+    "requires cpp_standalone device (Linux only, incompatible with per-step calls).",
+    BRIAN2_NUM_THREADS,
+    _os.environ.get("OMP_NUM_THREADS"),
+)

@@ -35,9 +35,10 @@ class OdorPlume:
       _amp : (K,)  float64  peak amplitude per puff
       _sig : (K,)  float64  spatial spread sigma per puff (metres)
     """
-    wind_mean:       np.ndarray = field(default_factory=lambda: np.array([0.3, 0.0, 0.0]))
+    wind_mean:       np.ndarray = field(default_factory=lambda: np.array([-0.3, 0.0, 0.0]))
     wind_noise_std:  float = 0.05
     puff_rate:       float = 10.0     # new puffs per second
+    puff_sigma:      float = 0.05     # Gaussian spread of each puff (metres)
     source_position: np.ndarray = field(default_factory=lambda: np.zeros(3))
     _rng:            np.random.Generator = field(default_factory=np.random.default_rng, repr=False)
     # Maximum arena radius; puffs beyond this are culled
@@ -74,7 +75,7 @@ class OdorPlume:
         if n_new > 0:
             new_pos = self.source_position[None, :] + self._rng.normal(0.0, 0.005, (n_new, 3))
             new_amp = np.ones(n_new, dtype=float)
-            new_sig = np.full(n_new, 0.02, dtype=float)
+            new_sig = np.full(n_new, self.puff_sigma, dtype=float)
 
             self._pos = np.concatenate([self._pos, new_pos], axis=0)
             self._amp = np.concatenate([self._amp, new_amp])
@@ -118,5 +119,15 @@ class OdorPlume:
 
 
 def sigmoid_gain(c: float, gain: float = 10.0, threshold: float = 0.1) -> float:
-    """Map odor concentration to depolarizing current in [0, 1]."""
-    return 1.0 / (1.0 + np.exp(-gain * (c - threshold)))
+    """
+    Map raw odor concentration to a normalised drive in [0, 1].
+
+    Shifted so that c=0 → 0 by subtracting the baseline sigmoid(0):
+      output = sigmoid(gain*(c - threshold)) - sigmoid(-gain*threshold)
+    clamped to [0, 1].  This ensures no-odor inputs produce zero
+    antennal drive rather than the ~0.27 baseline that the standard
+    sigmoid at threshold=0.1 gives.
+    """
+    baseline = 1.0 / (1.0 + np.exp(gain * threshold))   # sigmoid(0 - threshold)
+    raw = 1.0 / (1.0 + np.exp(-gain * (c - threshold)))
+    return float(np.clip(raw - baseline, 0.0, 1.0))

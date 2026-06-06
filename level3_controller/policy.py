@@ -50,11 +50,9 @@ def _pragmatic_cost(
     """
     Weighted squared deviation of predicted state from preferred outcomes.
 
-    Theoretical underpinning: this is the project's current approximation to
-    a prior-preference term over outcomes, not the filtering prior over hidden
-    state.  That distinction matters for active inference because the agent's
-    beliefs about what *is* should be separated from what it biologically or
-    task-wise *wants* to encounter.
+    Diagnostic / analysis utility — no longer called in the main action-
+    selection path (pymdp handles EFE internally).  Retained for logging
+    and offline analysis of individual EFE terms.
     """
     pref = controller.preferred_outcomes.preferred_mu.copy()
     pref_weight = controller.preferred_outcomes.preferred_weight
@@ -130,24 +128,37 @@ def expected_free_energy(
 
 def select_action(controller: ActiveInferenceController) -> BehavioralMode:
     """
-    Evaluate G for all four modes and return the mode with minimum EFE.
-    Hard-override: AVOID takes priority when obstacle is very close.
+    Return the behavioral mode with minimum continuous Expected Free Energy.
+
+    Uses the continuous EFE (pragmatic + epistemic value evaluated under the
+    current Level 2 Gaussian belief) as the policy selection criterion.
+    pymdp is retained for state inference (qs update) but its policy posterior
+    q_pi is not used here: the calibrated A matrix maps STOP→HIGH_odor and
+    STOP→AT_food, causing pymdp's EFE to prefer STOP regardless of actual
+    position (reward collapse when far from food).
+
+    Theoretical underpinning: G(π) = pragmatic_cost(predicted_state) −
+    epistemic_value(predicted_uncertainty); argmin_π G(π) selects the mode
+    that best reconciles predicted state with preferred outcomes (Eq. 4,
+    Friston et al. 2017).
+
+    Hard overrides (applied before EFE scoring):
+      1. AVOID — obstacle critically close (d_obs < _D_OBS_CLOSE / 2).
+      2. STOP  — food reached and odor confirmed (d_food < _D_FOOD_STOP and
+                 c_avg > 0.3).
     """
     d_obs  = controller.body_state.d_obs
     d_food = controller.body_state.d_food
     c_avg  = 0.5 * (controller.body_state.c_left + controller.body_state.c_right)
 
-    # Hard priority overrides (safety constraints)
     if d_obs < _D_OBS_CLOSE * 0.5:
         return BehavioralMode.AVOID
     if d_food < _D_FOOD_STOP and c_avg > 0.3:
         return BehavioralMode.STOP
 
-    g_values = {
-        mode: expected_free_energy(mode, controller)
-        for mode in BehavioralMode
-    }
-    return min(g_values, key=lambda m: g_values[m])
+    # Continuous EFE selection: score all four modes and pick argmin G
+    best_mode = min(BehavioralMode, key=lambda m: expected_free_energy(m, controller))
+    return best_mode
 
 
 def mode_to_motor_command(mode: BehavioralMode, controller: ActiveInferenceController) -> dict:

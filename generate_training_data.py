@@ -58,6 +58,7 @@ import itertools
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -84,13 +85,49 @@ _DEFAULT_G_NA       = [0.8, 1.0, 1.2]
 _DEFAULT_G_CAL      = [0.5, 1.0, 2.0]
 _DEFAULT_LAM        = 1.0
 _DEFAULT_SEED       = 42
+_DEFAULT_WORKERS    = 1
 
 # Drive scale: mean bilateral concentration → µA/cm² injected current
-_DRIVE_SCALE        = 3.0
+_DRIVE_SCALE        = 15.0   # µA/cm² per unit sigmoid output; HH rheobase ≈ 6.3 µA/cm²
 # Bilateral antenna separation (m)
 _ANT_OFFSET_Y       = 0.003
 # 1/f noise amplitude for biological variability in drive
 _NOISE_STD          = 0.15
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Top-level worker (must be module-level for multiprocessing pickling on Windows)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _job(args: tuple) -> tuple:
+    """
+    Run one (pos_idx, cond_idx) simulation and return serialisable results.
+    Signature kept flat so ProcessPoolExecutor can pickle it on Windows.
+    """
+    (
+        pos_idx, cond_idx, start_pos, g_ka, g_na, g_cal,
+        trial_ms, n_trials, seed_offset,
+    ) = args
+    rng = np.random.default_rng(_DEFAULT_SEED + seed_offset)
+    result = _simulate_condition(
+        start_pos=start_pos,
+        g_ka_scale=g_ka,
+        g_na_scale=g_na,
+        g_cal_scale=g_cal,
+        trial_ms=trial_ms,
+        n_trials=n_trials,
+        rng=rng,
+    )
+    spike_rate = float(result["spikes"].mean() * 1000)
+    return (
+        pos_idx, cond_idx,
+        result["spikes"],
+        result["X"],
+        result["drive_trace"],
+        result["c_left_trace"],
+        result["c_right_trace"],
+        spike_rate,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,30 +137,67 @@ _NOISE_STD          = 0.15
 def _make_position_grid(n_positions: int) -> list[np.ndarray]:
     """
     Return n_positions 3D starting positions that sample the plume's encounter
-    statistics across a range of upwind distances and lateral offsets.
+    statistics across a 2-D grid of upwind distances and lateral offsets.
 
-    Positions are evenly spread in a semicircle upwind of the source (source at
-    origin, wind blowing in +x direction).  This ensures the fly starts at
-    varying odor exposure levels:
-      - positions near x=-0.05 m (close upwind) → strong intermittent drive
-      - positions near x=-0.50 m (far upwind)   → weaker, sparser pulses
-      - lateral offsets (non-zero y)             → bilateral asymmetry / gradient
+    Grid axes
+    ---------
+    x  (upwind distance, negative = upwind of source at origin):
+        Three distance bands:
+          near   x ∈ [-0.05, -0.10] m  — strong, intermittent odor pulses
+          middle x ∈ [-0.15, -0.25] m  — moderate, patchy signal
+          far    x ∈ [-0.30, -0.50] m  — weak, sparse encounters
 
-    Biological motivation: the bilateral gradient column (Δc) in the design
-    matrix only becomes informative if the fly encounters plume edges.  Starting
-    at varied lateral positions ensures edge crossings appear in the training data.
+    y  (lateral offset from plume centreline):
+        [-0.06, -0.03, 0.0, +0.03, +0.06] m
+        Covering on-axis, edge, and off-plume positions.
+
+    The 15 canonical grid points are sub-sampled to n_positions using a
+    deterministic stride so the set remains spatially uniform for any
+    requested count.  If n_positions > 15 the extra slots are filled with
+    random jitter around the canonical grid.
+
+    Biological motivation
+    ---------------------
+    Varying upwind distance changes:
+      - mean concentration (∝ 1/r for a continuous source)
+      - intermittency: near-field encounters are bursty; far-field is sparse
+      - temporal autocorrelation of the drive trace
+
+    Varying lateral offset changes:
+      - bilateral gradient Δc = c_left − c_right (zero on-axis, maximal at edge)
+      - the sign of the gradient encodes plume side for casting
+
+    These two axes together ensure that every stimulus-filter column
+    (drive mean, intermittency, gradient) and the full range of olfactory
+    gain (sigmoid saturation vs. linear regime) appear in the training data.
     """
-    positions = []
-    # Upwind x range: -0.05 m (near source) to -0.50 m (far upwind)
-    x_values = np.linspace(-0.50, -0.05, max(n_positions // 2, 2))
-    # Two lateral offsets per x: centred on plume and shifted to plume edge
-    y_offsets = [0.0, 0.04]  # 0 cm (on-axis) and 4 cm lateral
-    for x in x_values:
+    # Canonical 3 × 5 = 15 grid points
+    x_distances = [-0.05, -0.15, -0.40]      # near / middle / far
+    y_offsets   = [-0.06, -0.03, 0.0, 0.03, 0.06]
+
+    canonical: list[np.ndarray] = []
+    for x in x_distances:
         for y in y_offsets:
-            positions.append(np.array([x, y, 0.0]))
-            if len(positions) >= n_positions:
-                return positions[:n_positions]
-    return positions[:n_positions]
+            canonical.append(np.array([x, y, 0.0]))
+
+    if n_positions <= len(canonical):
+        # Deterministic uniform stride keeps coverage even
+        stride = max(1, len(canonical) // n_positions)
+        return canonical[::stride][:n_positions]
+
+    # More requested than canonical: add jittered extras around the grid
+    rng = np.random.default_rng(0)
+    extras: list[np.ndarray] = []
+    while len(extras) < n_positions - len(canonical):
+        base = canonical[len(extras) % len(canonical)]
+        jitter = rng.uniform([-0.03, -0.015, 0], [0.0, 0.015, 0])
+        p = base + jitter
+        # Keep within arena bounds and upwind of source
+        p[0] = float(np.clip(p[0], -0.55, -0.02))
+        p[1] = float(np.clip(p[1], -0.08,  0.08))
+        extras.append(p)
+
+    return canonical + extras[:n_positions - len(canonical)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -155,9 +229,10 @@ def _simulate_condition(
 
     # ── Plume simulation ──────────────────────────────────────────────────────
     plume = OdorPlume(
-        wind_mean=np.array([0.3, 0.0, 0.0]),
+        wind_mean=np.array([-0.3, 0.0, 0.0]),   # blows toward -x where fly waits
         wind_noise_std=0.05,
         puff_rate=10.0,
+        puff_sigma=0.05,                          # 5 cm spread; 0.02 m was too narrow
         source_position=np.zeros(3),
         _rng=rng,
     )
@@ -261,6 +336,7 @@ def run_sweep(
     lam: float,
     seed: int,
     quiet: bool,
+    workers: int = 1,
 ) -> None:
     """Run the full parameter sweep and save results to out_dir."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -299,6 +375,17 @@ def run_sweep(
     if not _HAS_H5PY:
         npz_dir.mkdir(exist_ok=True)
 
+    def _already_done(pos_tag: str, cond_tag: str) -> bool:
+        """Return True if this (pos, cond) group already has spike data in HDF5."""
+        if not _HAS_H5PY or not h5_path.exists():
+            return False
+        try:
+            import h5py
+            with h5py.File(h5_path, "r") as f:
+                return f"{pos_tag}/{cond_tag}/spikes" in f
+        except Exception:
+            return False
+
     # Collect (X, y) pairs per condition (across positions) for fit_joint
     # Each condition has n_positions × n_trials spike trains, each of length T.
     # We pool all position × trial combinations into one (X_cond, y_cond) pair
@@ -308,94 +395,158 @@ def run_sweep(
 
     t0_total = time.time()
 
+    # ── Build job list, skipping already-completed conditions ─────────────────
+    job_args = []
+    skipped  = 0
     for pos_idx, start_pos in enumerate(positions):
         pos_tag = f"pos{pos_idx:02d}_x{start_pos[0]:.3f}_y{start_pos[1]:.3f}"
-        if not quiet:
-            print(f"Position {pos_idx + 1}/{n_positions}: {pos_tag}")
-
         for cond_idx, (g_ka, g_na, g_cal) in enumerate(cond_grid):
             cond_tag = f"gKA{g_ka:.2f}_gNa{g_na:.2f}_gCaL{g_cal:.2f}"
-            t0 = time.time()
+            if _already_done(pos_tag, cond_tag):
+                skipped += 1
+                continue
+            seed_offset = pos_idx * M + cond_idx
+            job_args.append((
+                pos_idx, cond_idx, start_pos, g_ka, g_na, g_cal,
+                trial_ms, n_trials, seed_offset,
+            ))
 
-            result = _simulate_condition(
+    total_jobs = n_positions * M
+    pending    = len(job_args)
+    if not quiet:
+        if skipped:
+            print(f"Resuming: {skipped}/{total_jobs} conditions already done, "
+                  f"{pending} remaining.")
+        if workers > 1:
+            print(f"Running {pending} jobs across {workers} worker processes.\n")
+
+    # ── Load already-completed data into X_list / y_list for fit_joint ────────
+    # Pre-populate from HDF5 so the fit uses all data including prior runs.
+    X_list = [None] * M   # type: ignore[assignment]
+    y_list = [None] * M   # type: ignore[assignment]
+
+    if _HAS_H5PY and h5_path.exists():
+        import h5py
+        with h5py.File(h5_path, "r") as f:
+            for pos_idx, start_pos in enumerate(positions):
+                pos_tag = f"pos{pos_idx:02d}_x{start_pos[0]:.3f}_y{start_pos[1]:.3f}"
+                if pos_tag not in f:
+                    continue
+                for cond_idx, (g_ka, g_na, g_cal) in enumerate(cond_grid):
+                    cond_tag = f"gKA{g_ka:.2f}_gNa{g_na:.2f}_gCaL{g_cal:.2f}"
+                    grp_path = f"{pos_tag}/{cond_tag}"
+                    if grp_path not in f:
+                        continue
+                    grp = f[grp_path]
+                    spikes = grp["spikes"][:]
+                    X      = grp["X"][:]
+                    X_p = np.tile(X, (n_trials, 1))
+                    y_p = spikes.reshape(-1).astype(float)
+                    if X_list[cond_idx] is None:
+                        X_list[cond_idx] = X_p
+                        y_list[cond_idx] = y_p
+                    else:
+                        X_list[cond_idx] = np.concatenate([X_list[cond_idx], X_p])
+                        y_list[cond_idx] = np.concatenate([y_list[cond_idx], y_p])
+
+    # ── Run pending jobs (serial or parallel) ─────────────────────────────────
+    completed = 0
+
+    def _handle_result(res: tuple) -> None:
+        """Persist one job result to HDF5/npz and accumulate into fit lists."""
+        nonlocal completed
+        (
+            pos_idx, cond_idx,
+            spikes, X,
+            drive_trace, c_left_trace, c_right_trace,
+            spike_rate,
+        ) = res
+        start_pos = positions[pos_idx]
+        g_ka, g_na, g_cal = cond_grid[cond_idx]
+        pos_tag  = f"pos{pos_idx:02d}_x{start_pos[0]:.3f}_y{start_pos[1]:.3f}"
+        cond_tag = f"gKA{g_ka:.2f}_gNa{g_na:.2f}_gCaL{g_cal:.2f}"
+
+        # Accumulate into fit lists
+        X_p = np.tile(X, (n_trials, 1))
+        y_p = spikes.reshape(-1).astype(float)
+        if X_list[cond_idx] is None:
+            X_list[cond_idx] = X_p
+            y_list[cond_idx] = y_p
+        else:
+            X_list[cond_idx] = np.concatenate([X_list[cond_idx], X_p])
+            y_list[cond_idx] = np.concatenate([y_list[cond_idx], y_p])
+
+        # Persist
+        if _HAS_H5PY:
+            import h5py
+            with h5py.File(h5_path, "a") as f:
+                grp = f.require_group(f"{pos_tag}/{cond_tag}")
+                for ds_name in ("spikes", "X", "drive_trace",
+                                "c_left_trace", "c_right_trace"):
+                    if ds_name in grp:
+                        del grp[ds_name]
+                grp.create_dataset("spikes",       data=spikes,      compression="gzip")
+                grp.create_dataset("X",            data=X,           compression="gzip")
+                grp.create_dataset("drive_trace",  data=drive_trace)
+                grp.create_dataset("c_left_trace", data=c_left_trace)
+                grp.create_dataset("c_right_trace",data=c_right_trace)
+                grp.attrs["g_KA"]         = g_ka
+                grp.attrs["g_Na"]         = g_na
+                grp.attrs["g_CaL"]        = g_cal
+                grp.attrs["start_pos"]    = start_pos
+                grp.attrs["spike_rate_Hz"]= spike_rate
+        else:
+            np.savez_compressed(
+                npz_dir / f"{pos_tag}_{cond_tag}.npz",
+                spikes=spikes, X=X,
+                drive_trace=drive_trace,
+                c_left_trace=c_left_trace,
+                c_right_trace=c_right_trace,
+                g_KA=np.array(g_ka), g_Na=np.array(g_na), g_CaL=np.array(g_cal),
                 start_pos=start_pos,
-                g_ka_scale=g_ka,
-                g_na_scale=g_na,
-                g_cal_scale=g_cal,
-                trial_ms=trial_ms,
-                n_trials=n_trials,
-                rng=rng,
             )
 
-            spikes = result["spikes"]   # (n_trials, T)
-            X      = result["X"]        # (T, 24)
-            T_     = X.shape[0]
+        completed += 1
+        if not quiet:
+            print(
+                f"  [{completed + skipped:4d}/{total_jobs}] "
+                f"{pos_tag}  {cond_tag}  "
+                f"{spike_rate:.1f} Hz"
+            )
 
-            spike_rate = spikes.mean() * 1000  # Hz
-            elapsed    = time.time() - t0
-
-            if not quiet:
-                print(
-                    f"  cond {cond_idx + 1:3d}/{M}  [{cond_tag}]  "
-                    f"spike rate: {spike_rate:.1f} Hz  "
-                    f"({elapsed:.1f}s)"
-                )
-
-            # Pool all trials from this position+condition into (X_pooled, y_pooled)
-            # Each trial shares the same X (deterministic mean drive), different y.
-            X_pooled = np.tile(X, (n_trials, 1))          # (n_trials*T, 24)
-            y_pooled = spikes.reshape(-1).astype(float)   # (n_trials*T,)
-
-            # Accumulate into the per-condition lists for fit_joint.
-            # If this is the first position for this condition, start a new entry;
-            # otherwise append to the existing accumulated data.
-            if pos_idx == 0:
-                X_list.append(X_pooled)
-                y_list.append(y_pooled)
-            else:
-                X_list[cond_idx] = np.concatenate([X_list[cond_idx], X_pooled], axis=0)
-                y_list[cond_idx] = np.concatenate([y_list[cond_idx], y_pooled])
-
-            # ── Persist raw data ─────────────────────────────────────────────
-            if _HAS_H5PY:
-                with h5py.File(h5_path, "a") as f:
-                    grp = f.require_group(f"{pos_tag}/{cond_tag}")
-                    # Overwrite datasets if they exist (re-run safety)
-                    for ds_name in ("spikes", "X", "drive_trace",
-                                    "c_left_trace", "c_right_trace"):
-                        if ds_name in grp:
-                            del grp[ds_name]
-                    grp.create_dataset("spikes",        data=spikes,               compression="gzip")
-                    grp.create_dataset("X",             data=X,                    compression="gzip")
-                    grp.create_dataset("drive_trace",   data=result["drive_trace"])
-                    grp.create_dataset("c_left_trace",  data=result["c_left_trace"])
-                    grp.create_dataset("c_right_trace", data=result["c_right_trace"])
-                    grp.attrs["g_KA"]      = g_ka
-                    grp.attrs["g_Na"]      = g_na
-                    grp.attrs["g_CaL"]     = g_cal
-                    grp.attrs["start_pos"] = start_pos
-                    grp.attrs["spike_rate_Hz"] = spike_rate
-            else:
-                npz_path = npz_dir / f"{pos_tag}_{cond_tag}.npz"
-                np.savez_compressed(
-                    npz_path,
-                    spikes=spikes,
-                    X=X,
-                    drive_trace=result["drive_trace"],
-                    c_left_trace=result["c_left_trace"],
-                    c_right_trace=result["c_right_trace"],
-                    g_KA=np.array(g_ka),
-                    g_Na=np.array(g_na),
-                    g_CaL=np.array(g_cal),
-                    start_pos=start_pos,
-                )
+    if workers > 1 and pending > 0:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_job, a): a for a in job_args}
+            for fut in as_completed(futures):
+                try:
+                    _handle_result(fut.result())
+                except Exception as exc:
+                    args_info = futures[fut]
+                    print(f"  ERROR pos={args_info[0]} cond={args_info[1]}: {exc}")
+    else:
+        for job_a in job_args:
+            t0 = time.time()
+            try:
+                res = _job(job_a)
+                _handle_result(res)
+                if not quiet:
+                    pass  # already printed inside _handle_result
+            except Exception as exc:
+                print(f"  ERROR: {exc}")
 
     total_elapsed = time.time() - t0_total
-    if not quiet:
+    if not quiet and pending:
         print(
-            f"\nAll conditions complete in {total_elapsed:.0f}s. "
+            f"\n{pending} new condition(s) complete in {total_elapsed:.0f}s. "
             f"Fitting joint PP-GLM over {M} conductance conditions …"
         )
+    elif not quiet:
+        print(f"\nAll {total_jobs} conditions already cached. "
+              f"Fitting joint PP-GLM over {M} conductance conditions …")
+
+    # Filter out any conditions that produced no data at all (shouldn't happen)
+    X_fit = [x for x in X_list if x is not None]
+    y_fit = [y for y in y_list if y is not None]
 
     # ── Joint PP-GLM fit with trend-filter penalty ────────────────────────────
     # fit_joint takes the M-element lists and finds beta vectors that smoothly
@@ -405,7 +556,7 @@ def run_sweep(
     #
     # For the closed-loop agent a single representative beta is used: the one
     # from the centre condition (closest to nominal g_KA=1, g_Na=1, g_CaL=1).
-    betas = fit_joint(X_list, y_list, lam=lam, max_iter=500)  # (M, 24)
+    betas = fit_joint(X_fit, y_fit, lam=lam, max_iter=500)  # (M, 24)
 
     # Find the index of the nominally closest condition
     nominal_idx = 0
@@ -479,6 +630,10 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="Trend-filter penalty strength for fit_joint")
     p.add_argument("--seed",        type=int,   default=_DEFAULT_SEED,
                    help="Global NumPy RNG seed")
+    p.add_argument("--workers",     type=int,   default=_DEFAULT_WORKERS,
+                   help="Parallel worker processes (1 = serial). "
+                        "Brian2 numpy target: set to number of CPU cores. "
+                        "Cython target: keep ≤ 4 to avoid compilation races.")
     p.add_argument("--quiet",       action="store_true",
                    help="Suppress per-condition progress output")
     return p
@@ -496,5 +651,6 @@ if __name__ == "__main__":
         g_cal_values=args.g_cal,
         lam=args.lam,
         seed=args.seed,
+        workers=args.workers,
         quiet=args.quiet,
     )

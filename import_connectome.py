@@ -16,7 +16,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from neuprint import Client, NeuronCriteria as NC, fetch_adjacencies, fetch_neurons
-from neuprint.utils import connection_table_to_matrix
 from scipy import sparse
 
 
@@ -100,31 +99,128 @@ def _export_skeletons(
     heal_distance: float | None,
     limit: int | None,
 ) -> dict[str, int]:
+    import time
+    from tqdm import tqdm
+
     skeleton_dir.mkdir(parents=True, exist_ok=True)
     selected_ids = body_ids[:limit] if limit is not None else body_ids
+    total = len(selected_ids)
+
+    print(f"Exporting {total} skeleton(s) to {skeleton_dir} ...")
 
     exported = 0
     failed = 0
-    for body_id in selected_ids:
-        out_path = skeleton_dir / f"{body_id}.swc"
-        try:
-            heal = heal_distance if heal_distance is not None else False
-            client.fetch_skeleton(
-                int(body_id),
-                heal=heal,
-                format="swc",
-                export_path=str(out_path),
-            )
-            exported += 1
-        except Exception as exc:
-            failed += 1
-            print(f"Failed to export skeleton for bodyId={body_id}: {exc}")
+    t0 = time.perf_counter()
+
+    with tqdm(selected_ids, unit="skeleton", dynamic_ncols=True) as pbar:
+        for body_id in pbar:
+            out_path = skeleton_dir / f"{body_id}.swc"
+            t_item = time.perf_counter()
+            try:
+                heal = heal_distance if heal_distance is not None else False
+                client.fetch_skeleton(
+                    int(body_id),
+                    heal=heal,
+                    format="swc",
+                    export_path=str(out_path),
+                )
+                exported += 1
+                elapsed_item = time.perf_counter() - t_item
+                pbar.set_postfix(
+                    ok=exported,
+                    fail=failed,
+                    last_s=f"{elapsed_item:.1f}s",
+                )
+            except Exception as exc:
+                failed += 1
+                tqdm.write(f"  FAILED bodyId={body_id}: {exc}")
+                pbar.set_postfix(ok=exported, fail=failed)
+
+    total_s = time.perf_counter() - t0
+    avg_s = total_s / max(exported + failed, 1)
+    print(
+        f"Done: {exported} exported, {failed} failed "
+        f"in {total_s:.1f}s  (avg {avg_s:.1f}s/skeleton)"
+    )
 
     return {
-        "requested": len(selected_ids),
+        "requested": total,
         "exported": exported,
         "failed": failed,
     }
+
+
+def run_skeleton_export(
+    server: str,
+    dataset: str,
+    token: str,
+    out_dir: Path,
+    interface_type_patterns: list[str],
+    interface_instance_patterns: list[str],
+    skeleton_limit: int | None,
+    heal_distance: float | None,
+    quiet: bool,
+) -> None:
+    """
+    Export SWC skeletons from already-cached neuron data without re-fetching
+    the full adjacency matrix.
+
+    Reads ``neurons.csv.gz`` from *out_dir*, applies the same interface-neuron
+    filter used by ``run_import``, then fetches SWC files from neuPrint.
+
+    If no interface patterns are given all traced neurons in the cache are
+    eligible (subject to ``--skeleton-limit``).
+    """
+    neurons_path = out_dir / "neurons.csv.gz"
+    if not neurons_path.exists():
+        raise FileNotFoundError(
+            f"Cached neuron table not found: {neurons_path}\n"
+            "Run the full import first (without --skeleton-only)."
+        )
+
+    if not quiet:
+        print(f"Loading cached neuron table from {neurons_path} ...")
+    neuron_df = pd.read_csv(neurons_path)
+
+    if interface_type_patterns or interface_instance_patterns:
+        interface_df = _filter_interface_neurons(
+            neuron_df,
+            type_patterns=interface_type_patterns,
+            instance_patterns=interface_instance_patterns,
+        )
+        if not quiet:
+            print(
+                f"Interface filter matched {len(interface_df)} / {len(neuron_df)} neurons."
+            )
+    else:
+        # No patterns → use all cached neurons (limit strongly recommended).
+        interface_df = neuron_df.copy()
+        if not quiet:
+            n = len(interface_df) if skeleton_limit is None else min(len(interface_df), skeleton_limit)
+            print(
+                f"No interface patterns given — exporting up to {n} skeletons "
+                f"from all {len(neuron_df)} cached neurons."
+            )
+
+    if interface_df.empty:
+        print("No neurons matched the interface filter. No skeletons exported.")
+        return
+
+    client = _make_client(server, dataset=dataset, token=token)
+
+    if not quiet:
+        print("Exporting skeletons ...")
+    summary = _export_skeletons(
+        client=client,
+        body_ids=interface_df["bodyId"].astype(int).tolist(),
+        skeleton_dir=out_dir / "skeletons",
+        heal_distance=heal_distance,
+        limit=skeleton_limit,
+    )
+
+    if not quiet:
+        print("Skeleton export complete.")
+        print(json.dumps(summary, indent=2))
 
 
 def run_import(
@@ -157,9 +253,26 @@ def run_import(
 
     if not quiet:
         print("Building connectivity matrix...")
-    matrix_df = connection_table_to_matrix(conn_df, group_cols="bodyId", weight_col="weight", sort_by="bodyId")
-    body_ids = matrix_df.index.to_numpy(dtype=np.int64)
-    matrix_sparse = sparse.csr_matrix(matrix_df.to_numpy(dtype=np.float32))
+    # Build a sparse matrix directly from the edge list to avoid the
+    # dense pivot that overflows with the full male-CNS neuron count.
+    all_ids = np.union1d(
+        conn_df["bodyId_pre"].to_numpy(dtype=np.int64),
+        conn_df["bodyId_post"].to_numpy(dtype=np.int64),
+    )
+    # Include neurons that have no edges (they exist in neuron_df but may not
+    # appear in conn_df after weight filtering).
+    if not neuron_df.empty and "bodyId" in neuron_df.columns:
+        all_ids = np.union1d(all_ids, neuron_df["bodyId"].to_numpy(dtype=np.int64))
+    body_ids = np.sort(all_ids)
+    id_to_idx: dict[int, int] = {int(bid): i for i, bid in enumerate(body_ids)}
+
+    row_indices = conn_df["bodyId_pre"].map(id_to_idx).to_numpy(dtype=np.int32)
+    col_indices = conn_df["bodyId_post"].map(id_to_idx).to_numpy(dtype=np.int32)
+    weights = conn_df["weight"].to_numpy(dtype=np.float32)
+    n = len(body_ids)
+    matrix_sparse = sparse.csr_matrix(
+        (weights, (row_indices, col_indices)), shape=(n, n), dtype=np.float32
+    )
 
     _export_table(neuron_df, out_dir / "neurons.csv.gz")
     _export_table(roi_counts_df, out_dir / "roi_counts.csv.gz")
@@ -249,6 +362,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional skeleton healing distance passed to neuPrint fetch_skeleton",
     )
     parser.add_argument("--quiet", action="store_true", help="Suppress progress output")
+    parser.add_argument(
+        "--skeleton-only",
+        action="store_true",
+        help=(
+            "Export SWC skeletons from already-cached neurons.csv.gz without "
+            "re-fetching the full adjacency matrix. Useful after a completed "
+            "import when you only need (more) skeletons."
+        ),
+    )
     return parser
 
 
@@ -260,6 +382,20 @@ def main() -> None:
 
     if args.list_datasets:
         list_datasets(server=args.server, token=token)
+        return
+
+    if args.skeleton_only:
+        run_skeleton_export(
+            server=args.server,
+            dataset=args.dataset,
+            token=token,
+            out_dir=Path(args.out_dir),
+            interface_type_patterns=args.interface_type,
+            interface_instance_patterns=args.interface_instance,
+            skeleton_limit=args.skeleton_limit,
+            heal_distance=args.heal_distance,
+            quiet=args.quiet,
+        )
         return
 
     run_import(

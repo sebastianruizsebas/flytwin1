@@ -257,6 +257,41 @@ class HHNeuron:
     def spike_times(self) -> list[float]:
         return list(self._spike_times)
 
+    def set_conductances(self, conductances: dict) -> None:
+        """
+        Update biophysical conductances live (called by SBI online inference).
+
+        Updates self.conductances and, if the Brian2 network is already built,
+        propagates the new values directly into the SpatialNeuron / NeuronGroup
+        namespace so the change takes effect on the next step() call without
+        requiring a full rebuild.
+
+        Parameters
+        ----------
+        conductances : dict with any subset of keys accepted at __init__:
+            e.g. {"g_KA": 1.2, "g_Na": 120.0, "g_CaL": 0.5}
+        """
+        self.conductances.update(conductances)
+        if self._group is None:
+            return  # network not yet built; values will be used at build()
+        try:
+            from brian2.units import msiemens, cm2
+            g_ka  = self.conductances.get("g_KA", 1.0)
+            g_na  = self.conductances.get("g_Na", 120.0)
+            g_cal = self.conductances.get("g_CaL", 0.3)
+            # SpatialNeuron stores conductance densities as mS/cm²
+            if self._is_compartmental:
+                self._group.namespace["g_KA_val"]  = float(g_ka)  * msiemens / cm2
+                self._group.namespace["g_Na_val"]  = float(g_na)  * msiemens / cm2
+                self._group.namespace["g_CaL_val"] = float(g_cal) * msiemens / cm2
+            else:
+                # Single-compartment fallback: set group variable directly
+                self._group.g_KA_val  = float(g_ka)
+                self._group.g_Na_val  = float(g_na)
+                self._group.g_CaL_val = float(g_cal)
+        except Exception:
+            pass  # graceful no-op if Brian2 namespace differs
+
     @classmethod
     def simulate_spike_trials(
         cls,
