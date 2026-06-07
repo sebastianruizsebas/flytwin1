@@ -145,7 +145,12 @@ def _detect_brian2_target() -> str:
     return "numpy"
 
 
-BRIAN2_TARGET: str = _detect_brian2_target()
+# Allow an environment variable override so that worker processes (spawned by
+# generate_training_data.py with ProcessPoolExecutor) can force the "cython"
+# target and avoid brian2cuda standalone-device conflicts when 32 workers run
+# simultaneously.  Set FLYTWIN_BRIAN2_TARGET=cython before launching workers.
+_target_override = os.environ.get("FLYTWIN_BRIAN2_TARGET", "").strip()
+BRIAN2_TARGET: str = _target_override if _target_override else _detect_brian2_target()
 
 
 # ── Brian2 thread count ────────────────────────────────────────────────────────

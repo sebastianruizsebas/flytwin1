@@ -31,9 +31,10 @@ Optional flags
   --g-na        FLOATS...   g_Na scale values  (default: 0.8 1.0 1.2)
   --g-cal       FLOATS...   g_CaL scale values (default: 0.5 1.0 2.0)
   --lam         FLOAT       trend-filter lambda (default: 1.0)
-  --workers     INT         parallel worker processes (default: 1; set >1 for
-                            multi-core; note: Brian2 has its own threading,
-                            keep workers low)
+  --workers     INT         parallel worker processes (default: cpu_count, i.e.
+                            one worker per logical core; each worker forces
+                            Brian2 to cython target and limits BLAS threads to 1
+                            to avoid oversubscription)
   --seed        INT         global RNG seed (default: 42)
   --quiet                   suppress per-condition progress lines
 
@@ -85,7 +86,7 @@ _DEFAULT_G_NA       = [0.8, 1.0, 1.2]
 _DEFAULT_G_CAL      = [0.5, 1.0, 2.0]
 _DEFAULT_LAM        = 1.0
 _DEFAULT_SEED       = 42
-_DEFAULT_WORKERS    = 1
+_DEFAULT_WORKERS    = os.cpu_count() or 1
 
 # Drive scale: mean bilateral concentration → µA/cm² injected current
 _DRIVE_SCALE        = 15.0   # µA/cm² per unit sigmoid output; HH rheobase ≈ 6.3 µA/cm²
@@ -98,6 +99,32 @@ _NOISE_STD          = 0.15
 # ─────────────────────────────────────────────────────────────────────────────
 # Top-level worker (must be module-level for multiprocessing pickling on Windows)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _worker_init_func() -> None:
+    """
+    Initializer called once in each worker process of ProcessPoolExecutor.
+
+    Forces the Brian2 codegen target to "cython" so that all 32 workers use
+    CPU-JIT compilation rather than fighting over a single cuda_standalone
+    device.  Also limits BLAS threads to 1 per worker, preventing the
+    (workers × BLAS_threads) oversubscription that thrashes the CPU.
+
+    Theoretical role: one worker = one logical core; Brian2 Cython simulations
+    are single-threaded, so this achieves near-linear scaling across 32 cores.
+    """
+    import os as _os
+    _os.environ["FLYTWIN_BRIAN2_TARGET"] = "cython"
+    _os.environ["FLYTWIN_WORKER_MODE"]    = "1"
+    try:
+        from threadpoolctl import threadpool_limits
+        threadpool_limits(limits=1, user_api="blas")
+    except ImportError:
+        # threadpoolctl not installed; BLAS may use multiple threads per worker.
+        # Performance will still be correct but throughput may be sub-optimal.
+        _os.environ.setdefault("OMP_NUM_THREADS",    "1")
+        _os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+        _os.environ.setdefault("MKL_NUM_THREADS",     "1")
+
 
 def _job(args: tuple) -> tuple:
     """
@@ -515,7 +542,7 @@ def run_sweep(
             )
 
     if workers > 1 and pending > 0:
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init_func) as pool:
             futures = {pool.submit(_job, a): a for a in job_args}
             for fut in as_completed(futures):
                 try:
@@ -631,9 +658,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--seed",        type=int,   default=_DEFAULT_SEED,
                    help="Global NumPy RNG seed")
     p.add_argument("--workers",     type=int,   default=_DEFAULT_WORKERS,
-                   help="Parallel worker processes (1 = serial). "
-                        "Brian2 numpy target: set to number of CPU cores. "
-                        "Cython target: keep ≤ 4 to avoid compilation races.")
+                   help=f"Parallel worker processes (default: cpu_count = {_DEFAULT_WORKERS}). "
+                        "Each worker forces Brian2 to Cython target and limits BLAS threads "
+                        "to 1, so one worker maps to one logical core safely.")
     p.add_argument("--quiet",       action="store_true",
                    help="Suppress per-condition progress output")
     return p

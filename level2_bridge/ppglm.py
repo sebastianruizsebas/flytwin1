@@ -17,6 +17,8 @@ Online interface (Phase 2c):
 """
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -257,10 +259,23 @@ def fit_joint(
     """
     Jointly fit M GLMs with trend-filter penalty using L-BFGS-B.
 
-    When JAX is available the log-likelihood gradient is computed via JAX
-    autodiff (JIT-compiled, GPU-accelerated for large T).  The L-BFGS-B
-    optimiser itself still runs in scipy on the host; only the inner
-    gradient evaluation is accelerated.
+    Gradient acceleration strategy
+    --------------------------------
+    JAX path (GPU/CPU-JAX available):
+      If all M conditions share the same T, stacks them into (M, T, D) and
+      uses ``jax.vmap`` over conditions — a single fused GPU kernel per
+      L-BFGS-B iteration replaces M sequential kernel launches.
+      Falls back to a JIT-compiled sequential loop when T differs.
+
+    NumPy path (no JAX):
+      Uses ``ThreadPoolExecutor(max_workers=min(M, cpu_count))`` to evaluate
+      per-condition log-likelihood + gradient in parallel.  OpenBLAS/MKL
+      release the GIL for DGEMM, so threads genuinely overlap on multi-core.
+      The thread pool is created once before ``minimize`` and shut down after,
+      avoiding per-iteration creation overhead.
+
+    The trend-filter penalty (coupling across M conditions) is evaluated on
+    the host after all per-condition gradients are collected.
 
     Parameters
     ----------
@@ -276,6 +291,8 @@ def fit_joint(
     M = len(X_list)
     D = X_list[0].shape[1]  # 24
 
+    _numpy_pool = None  # populated only on the numpy path; shut down after minimize
+
     if HAS_JAX:
         # ── JAX-accelerated gradient path ──────────────────────────────
         import jax
@@ -285,49 +302,104 @@ def fit_joint(
         Xs_jax = [jnp.asarray(X, dtype=jnp.float32) for X in X_list]
         ys_jax = [jnp.asarray(y, dtype=jnp.float32) for y in y_list]
 
-        @jax.jit
-        def _neg_ll_single(beta_i, X, y):
-            p = jax.nn.sigmoid(X @ beta_i)
-            p = jnp.clip(p, 1e-9, 1.0 - 1e-9)
-            return -jnp.sum(y * jnp.log(p) + (1.0 - y) * jnp.log(1.0 - p))
+        # ── Fast path: vmap over conditions when all T_i are equal ────────
+        _shapes_equal = all(X.shape == X_list[0].shape for X in X_list)
 
-        _neg_ll_and_grad = jax.jit(jax.value_and_grad(_neg_ll_single))
+        if _shapes_equal and M > 1:
+            # Stack: (M, T, D) and (M, T) — one fused GPU kernel per optimizer step
+            X_stack = jnp.stack(Xs_jax, axis=0)   # (M, T, D)
+            y_stack = jnp.stack(ys_jax, axis=0)   # (M, T)
 
-        def objective_and_grad(flat_beta: np.ndarray):
-            betas = flat_beta.reshape(M, D)
-            loss = 0.0
-            grad = np.zeros_like(betas)
+            @jax.jit
+            def _neg_ll_single_v(beta_i, X_i, y_i):
+                p = jax.nn.sigmoid(X_i @ beta_i)
+                p = jnp.clip(p, 1e-9, 1.0 - 1e-9)
+                return -jnp.sum(y_i * jnp.log(p) + (1.0 - y_i) * jnp.log(1.0 - p))
 
-            for i, (X, y) in enumerate(zip(Xs_jax, ys_jax)):
-                beta_i = jnp.asarray(betas[i], dtype=jnp.float32)
-                nll, g = _neg_ll_and_grad(beta_i, X, y)
-                loss += float(nll)
-                grad[i] += np.asarray(g, dtype=float)
+            _vmap_nll_grad = jax.jit(
+                jax.vmap(jax.value_and_grad(_neg_ll_single_v), in_axes=(0, 0, 0))
+            )
 
-            if M > 1:
-                for i in range(M - 1):
-                    diff = betas[i + 1] - betas[i]
-                    pen = _smooth_l1(diff)
-                    g = _smooth_l1_grad(diff)
-                    loss += lam * pen
-                    grad[i]     -= lam * g
-                    grad[i + 1] += lam * g
+            def objective_and_grad(flat_beta: np.ndarray):
+                betas_jax = jnp.asarray(flat_beta.reshape(M, D), dtype=jnp.float32)
+                nlls, grads = _vmap_nll_grad(betas_jax, X_stack, y_stack)
+                loss = float(jnp.sum(nlls))
+                grad = np.asarray(grads, dtype=float)        # (M, D)
 
-            return loss, grad.ravel()
+                if M > 1:
+                    betas_np = flat_beta.reshape(M, D)
+                    for i in range(M - 1):
+                        diff = betas_np[i + 1] - betas_np[i]
+                        pen = _smooth_l1(diff)
+                        g = _smooth_l1_grad(diff)
+                        loss += lam * pen
+                        grad[i]     -= lam * g
+                        grad[i + 1] += lam * g
+
+                return loss, grad.ravel()
+
+        else:
+            # ── Fallback: sequential JIT when T differs across conditions ──
+            @jax.jit
+            def _neg_ll_single(beta_i, X, y):
+                p = jax.nn.sigmoid(X @ beta_i)
+                p = jnp.clip(p, 1e-9, 1.0 - 1e-9)
+                return -jnp.sum(y * jnp.log(p) + (1.0 - y) * jnp.log(1.0 - p))
+
+            _neg_ll_and_grad = jax.jit(jax.value_and_grad(_neg_ll_single))
+
+            def objective_and_grad(flat_beta: np.ndarray):
+                betas = flat_beta.reshape(M, D)
+                loss = 0.0
+                grad = np.zeros_like(betas)
+
+                for i, (X, y) in enumerate(zip(Xs_jax, ys_jax)):
+                    beta_i = jnp.asarray(betas[i], dtype=jnp.float32)
+                    nll, g = _neg_ll_and_grad(beta_i, X, y)
+                    loss += float(nll)
+                    grad[i] += np.asarray(g, dtype=float)
+
+                if M > 1:
+                    for i in range(M - 1):
+                        diff = betas[i + 1] - betas[i]
+                        pen = _smooth_l1(diff)
+                        g = _smooth_l1_grad(diff)
+                        loss += lam * pen
+                        grad[i]     -= lam * g
+                        grad[i + 1] += lam * g
+
+                return loss, grad.ravel()
 
     else:
-        # ── Pure-numpy gradient path (fallback) ──────────────────────────
+        # ── Pure-numpy gradient path, parallelised over conditions ─────────
+        # One thread per condition (up to cpu_count).  OpenBLAS/MKL release
+        # the GIL for DGEMM, so threads genuinely overlap on multi-core CPUs.
+        # The pool is created once here and shut down after minimize() returns.
+        _n_threads = min(M, os.cpu_count() or 1)
+        _numpy_pool = _ThreadPoolExecutor(max_workers=_n_threads)
+
+        def _cond_task(args):
+            """Compute nll and gradient for one condition (called in a thread)."""
+            i, beta_i = args
+            X_i, y_i = X_list[i], y_list[i]
+            eta = X_i @ beta_i
+            p = sigmoid(eta)
+            p = np.clip(p, 1e-9, 1 - 1e-9)
+            nll = -float(np.sum(y_i * np.log(p) + (1 - y_i) * np.log(1 - p)))
+            g   = -(X_i.T @ (y_i - p))
+            return i, nll, g
+
         def objective_and_grad(flat_beta: np.ndarray):
             betas = flat_beta.reshape(M, D)
-            loss = 0.0
-            grad = np.zeros_like(betas)
+            loss  = 0.0
+            grad  = np.zeros_like(betas)
 
-            for i, (X, y) in enumerate(zip(X_list, y_list)):
-                eta = X @ betas[i]
-                p = sigmoid(eta)
-                p = np.clip(p, 1e-9, 1 - 1e-9)
-                loss -= float(np.sum(y * np.log(p) + (1 - y) * np.log(1 - p)))
-                grad[i] -= X.T @ (y - p)
+            # Submit all M conditions in parallel; map preserves input order
+            for i, nll_i, g_i in _numpy_pool.map(
+                _cond_task, [(i, betas[i].copy()) for i in range(M)]
+            ):
+                loss += nll_i
+                grad[i] += g_i
 
             if M > 1:
                 for i in range(M - 1):
@@ -341,13 +413,17 @@ def fit_joint(
             return loss, grad.ravel()
 
     beta0 = np.zeros(M * D)
-    result = minimize(
-        objective_and_grad,
-        beta0,
-        method="L-BFGS-B",
-        jac=True,
-        options={"maxiter": max_iter, "ftol": 1e-8, "gtol": 1e-5},
-    )
+    try:
+        result = minimize(
+            objective_and_grad,
+            beta0,
+            method="L-BFGS-B",
+            jac=True,
+            options={"maxiter": max_iter, "ftol": 1e-8, "gtol": 1e-5},
+        )
+    finally:
+        if _numpy_pool is not None:
+            _numpy_pool.shutdown(wait=False)
     return result.x.reshape(M, D)
 
 

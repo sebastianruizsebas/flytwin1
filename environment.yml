@@ -20,20 +20,37 @@ dependencies:
   - tqdm
   - brian2
   - numba
+  # Parallelism helpers
+  - joblib          # parallel PP-GLM condition gradient computation
+  - threadpoolctl   # per-worker BLAS thread limiting (also pulled in by scikit-learn)
+  # Video rendering — headless/WSL2 compatible
+  - ffmpeg          # required by mediapy; also available via: sudo apt-get install ffmpeg
   # Jupyter
   - jupyter
   - ipykernel
   - pip:
-      # ── GPU wheels (install AFTER conda env create + activate) ──────────
-      # PyTorch CUDA 13.2 — use cu132 for CUDA 13.2:
-      #   pip install --index-url https://download.pytorch.org/whl/cu132 torch torchvision torchaudio
-      # JAX CUDA 13 + cuDNN:
-      #   pip install --upgrade "jax[cuda13_cudnn]" -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
-      # brian2cuda (GPU Brian2, Linux only, requires CUDA 13 + cmake):
-      #   pip install brian2cuda  # Linux only — do NOT install on Windows/macOS
-      # CPU fallbacks (no NVIDIA GPU):
-      #   pip install torch torchvision torchaudio   # default PyPI index = CPU
+      # ── GPU wheels for WSL2 Ubuntu + CUDA 13.3 toolkit ──────────────────
+      # CUDA 13.x drivers are forward-compatible with CUDA 12 pip wheels.
+      # Use CUDA 12 pip wheels for JAX and PyTorch — they bundle their own
+      # CUDA 12 runtime libs (cuBLAS, cuDNN) so no system CUDA 12 install
+      # is needed alongside the CUDA 13.3 toolkit.
+      #
+      # JAX CUDA 12 (recommended for WSL2 + CUDA 13.x driver):
+      #   pip install --upgrade "jax[cuda12_pip]" \
+      #       -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html
+      #
+      # PyTorch CUDA 12.4 (works with CUDA 13.x driver):
+      #   pip install --index-url https://download.pytorch.org/whl/cu124 \
+      #       torch torchvision torchaudio
+      #
+      # brian2cuda (GPU Brian2, Linux/WSL2 only, compiles against CUDA 12+):
+      #   pip install brian2cuda
+      #   # Set FLYTWIN_BRIAN2_TARGET=cuda_standalone or let accelerator.py
+      #   # auto-detect.  Do NOT install on Windows/macOS native.
+      #
+      # CPU-only fallbacks (no NVIDIA GPU):
       #   pip install "jax[cpu]"
+      #   pip install torch torchvision torchaudio   # default PyPI = CPU build
       # ────────────────────────────────────────────────────────────────────
       # Active Inference discrete POMDP controller (Level 3)
       # Use 0.0.7.1 — the 1.x API is incompatible (Agent expects obj_array not list)
@@ -47,3 +64,7 @@ dependencies:
       - dm_control
       # Janelia fly body model
       - git+https://github.com/TuragaLab/flybody.git
+      # Video frame writer — uses ffmpeg backend (from conda-forge above)
+      - mediapy
+      # WSL2-headless video writing fallback (no display required)
+      - opencv-python-headless

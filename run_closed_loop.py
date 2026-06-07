@@ -468,153 +468,322 @@ def BehavioralModeStr(mode_int: int | None) -> str:
 def save_trajectory_video(
     log_path: str,
     video_path: str,
-    fps: int = 30,
+    fps: int = 5,
     trail_ms: int = 2000,
 ) -> None:
     """
-    Render a top-down 2D animation of the agent trajectory from a run log.
+    Render a 3D+2D animation of the agent trajectory from a run log.
 
-    Uses only matplotlib + mediapy -- no MuJoCo required.
-    Each frame shows:
-      - Full past trajectory (faded grey trail)
-      - Last `trail_ms` ms coloured by behavioral mode
-      - Current heading arrow
-      - Odor source / food marker and obstacle cylinders
-      - Wind direction arrow, arena walls
-      - Mode label and time readout
+    Headless-compatible (matplotlib Agg backend; no display required on WSL2).
+    Writes the video via mediapy (requires ffmpeg from conda-forge), falling
+    back to opencv-python-headless if mediapy is unavailable.
+
+    Each frame shows two panels:
+      Left — 3D perspective view
+        * Semi-transparent arena floor
+        * Odor plume: translucent cone from source expanding downwind
+        * Obstacles: 3D cylinders
+        * Wind direction: quiver arrows at z = 0.02 m
+        * Fly body: thorax (large dot) + head (small dot offset forward)
+          + wing line perpendicular to heading + red heading arrow
+        * Trajectory coloured by behavioral mode
+      Right — top-down 2D view (reference) with log-likelihood timeline
 
     Parameters
     ----------
     log_path    : path to HDF5 log written by run_closed_loop.run()
-    video_path  : output mp4 / gif path
-    fps         : playback frame rate; lower values show each step longer
-                  (default 5 = one control-step visible for 200 ms wall-clock)
-    trail_ms    : ms of trajectory to colour by mode in each frame
+    video_path  : output .mp4 path (mediapy uses ffmpeg; requires ffmpeg on PATH)
+    fps         : playback frame rate (default 5 — each frame = 400 ms sim time)
+    trail_ms    : ms of recent trajectory to colour by mode per frame
     """
     import h5py
     import matplotlib
-    matplotlib.use("Agg")  # headless rendering
+    matplotlib.use("Agg")  # headless rendering — no X display needed on WSL2
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
-    import mediapy
+    import matplotlib.gridspec as gridspec
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers '3d' projection
 
     MODE_COLORS = {0: "#2196F3", 1: "#FF9800", 2: "#F44336", 3: "#4CAF50"}
     MODE_NAMES  = {0: "SURGE",   1: "CAST",    2: "AVOID",   3: "STOP"}
 
-    # Environment geometry (must match OdorPlume source_position and arena.xml)
-    ODOR_SOURCE_XY  = (0.0, 0.0)           # source_position=zeros in run()
-    ARENA_HALF_X    = 1.0                   # wall_upwind/wall_downwind at ±1 m
-    ARENA_HALF_Y    = 1.0
-    WIND_DIR_XY     = (-0.2, 0.0)          # wind_mean from run()
-    # Obstacle positions from arena.xml (visual only; d_obs not yet live)
-    OBSTACLES_XY    = [(-0.25, 0.15), (-0.25, -0.15)]
-    OBS_RADIUS      = 0.02
+    # ── Scene geometry (must match OdorPlume / arena.xml settings in run()) ──
+    ODOR_SOURCE   = np.array([0.0, 0.0, 0.0])
+    ARENA_HALF_X  = 0.8    # display extents (arena walls at ±1 m)
+    ARENA_HALF_Y  = 0.6
+    WIND_DIR_NORM = np.array([-1.0, 0.0, 0.0])   # wind blows toward -x
+    OBSTACLES_XY  = [(-0.25, 0.15), (-0.25, -0.15)]
+    OBS_RADIUS    = 0.02
+    OBS_HEIGHT    = 0.05
+    FLY_BODY_LEN  = 0.022   # half body length (m)
+    FLY_BODY_WID  = 0.008   # half body width  (m)
+    FLY_WING_SPAN = 0.020   # half wing span   (m)
 
     with h5py.File(log_path, "r") as f:
         pos   = f["positions"][:]   # (T, 3): x, y, theta
         modes = f["modes"][:]       # (T,) int
-        liks  = f["log_liks"][:]
+        liks  = f["log_liks"][:]    # (T,) float
 
     T = len(pos)
     if T == 0:
         print("No logged positions found — nothing to render.")
         return
 
-    # Subsample: one frame every 20 logged steps (400 ms) for manageable video
-    frame_stride = max(1, int(20))
+    frame_stride  = max(1, 20)
     frame_indices = list(range(0, T, frame_stride))
+    x, y, theta   = pos[:, 0], pos[:, 1], pos[:, 2]
+    trail_steps   = trail_ms // 20   # 20 ms per logged control step
 
-    x, y, theta = pos[:, 0], pos[:, 1], pos[:, 2]
-    trail_steps = trail_ms // 20  # 20 ms per control step
+    # ── Pre-compute static 3D geometry (numpy arrays, reused every frame) ──
+    # Odor plume: cone from (0,0,0) opening in the -x (downwind) direction.
+    # The plume rises slightly in z to avoid clipping the floor.
+    n_d, n_a = 20, 18
+    _d  = np.linspace(0.0, 0.75, n_d)
+    _a  = np.linspace(0.0, 2.0 * np.pi, n_a)
+    _D, _A = np.meshgrid(_d, _a)
+    _R  = _D * np.tan(np.radians(18))
+    PX  = -_D                            # downwind direction
+    PY  =  _R * np.cos(_A)
+    PZ  =  _R * np.sin(_A) * 0.25        # flatten in z
 
-    # Expand axes to always include the odor source and arena bounds
-    x_min = min(x.min() - 0.05, -ARENA_HALF_X * 0.1)
-    x_max = max(x.max() + 0.05,  ODOR_SOURCE_XY[0] + 0.1)
-    y_min = min(y.min() - 0.05,  ODOR_SOURCE_XY[1] - 0.1)
-    y_max = max(y.max() + 0.05,  ODOR_SOURCE_XY[1] + 0.1)
+    # Obstacle cylinders: pre-compute surface meshes
+    _cu  = np.linspace(0.0, 2.0 * np.pi, 16)
+    _cz  = np.array([0.0, OBS_HEIGHT])
+    _CU, _CZ = np.meshgrid(_cu, _cz)
+    CYL_COS = np.cos(_CU)
+    CYL_SIN = np.sin(_CU)
+
+    # Wind arrow origin grid: rows of arrows along the arena at z = 0.02 m
+    _wx = np.linspace(-0.65, -0.05, 5)
+    _wy = np.linspace(-0.45, 0.45, 4)
+    WX, WY = np.meshgrid(_wx, _wy)
+    WX, WY = WX.ravel(), WY.ravel()
+    WZ  = np.full_like(WX, 0.020)
+    WU  = np.full_like(WX, -0.055)   # arrow length (m) in wind direction
+    WV  = np.zeros_like(WX)
+    WW  = np.zeros_like(WX)
+
+    # Axis extents for 3D view
+    x_lo = min(float(x.min()) - 0.05, -ARENA_HALF_X)
+    x_hi = max(float(x.max()) + 0.05,  0.10)
+    y_lo = min(float(y.min()) - 0.05, -ARENA_HALF_Y)
+    y_hi = max(float(y.max()) + 0.05,  ARENA_HALF_Y)
+    # Arena floor for 3D (corner points only — single polygon)
+    AF_X = np.array([[x_lo, x_hi], [x_lo, x_hi]])
+    AF_Y = np.array([[y_lo, y_lo], [y_hi, y_hi]])
+    AF_Z = np.zeros((2, 2))
 
     frames = []
-    for fi in frame_indices:
-        fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
-        ax.set_xlim(x_min, x_max)
-        ax.set_ylim(y_min, y_max)
-        ax.set_aspect("equal")
-        ax.set_facecolor("#1a1a2e")
-        fig.patch.set_facecolor("#1a1a2e")
-        ax.tick_params(colors="white")
-        for spine in ax.spines.values():
-            spine.set_edgecolor("white")
+    n_frames = len(frame_indices)
+    for fi_idx, fi in enumerate(frame_indices):
+        fig = plt.figure(figsize=(12, 5), dpi=100)
+        fig.patch.set_facecolor("#0d0d1a")
+        gs = gridspec.GridSpec(2, 2, figure=fig,
+                               width_ratios=[1.6, 1.0],
+                               height_ratios=[1.6, 0.8],
+                               hspace=0.35, wspace=0.30)
 
-        # Arena walls
-        for wx in [-ARENA_HALF_X, ARENA_HALF_X]:
-            ax.axvline(wx, color="#556", lw=1.0, ls="--", alpha=0.6)
-        for wy in [-ARENA_HALF_Y, ARENA_HALF_Y]:
-            ax.axhline(wy, color="#556", lw=1.0, ls="--", alpha=0.6)
+        # ────────────────────────────────────────────────────────────────
+        # LEFT — 3D perspective view (spans both rows)
+        # ────────────────────────────────────────────────────────────────
+        ax3d = fig.add_subplot(gs[:, 0], projection="3d")
+        ax3d.set_facecolor("#0d0d1a")
+        ax3d.set_xlim(x_lo, x_hi)
+        ax3d.set_ylim(y_lo, y_hi)
+        ax3d.set_zlim(0.0, 0.12)
+        ax3d.set_xlabel("x (m)", color="white", fontsize=6, labelpad=2)
+        ax3d.set_ylabel("y (m)", color="white", fontsize=6, labelpad=2)
+        ax3d.set_zlabel("z (m)", color="white", fontsize=6, labelpad=2)
+        ax3d.tick_params(colors="white", labelsize=5)
+        ax3d.xaxis.pane.fill = False
+        ax3d.yaxis.pane.fill = False
+        ax3d.zaxis.pane.fill = False
+        ax3d.xaxis.pane.set_edgecolor("#222244")
+        ax3d.yaxis.pane.set_edgecolor("#222244")
+        ax3d.zaxis.pane.set_edgecolor("#222244")
+        ax3d.set_box_aspect([1.6, 1.2, 0.25])
+        ax3d.view_init(elev=28, azim=-65)
 
-        # Obstacle cylinders (from arena.xml; d_obs not yet live)
+        # Arena floor (subtle)
+        ax3d.plot_surface(AF_X, AF_Y, AF_Z,
+                          alpha=0.06, color="#334466",
+                          rstride=1, cstride=1, linewidth=0)
+
+        # Odor plume (translucent cone, semi-static)
+        ax3d.plot_surface(PX, PY, PZ,
+                          alpha=0.07, color="#FFD700",
+                          rstride=2, cstride=2, linewidth=0)
+
+        # Obstacle cylinders
         for ox, oy in OBSTACLES_XY:
-            circ = plt.Circle((ox, oy), OBS_RADIUS, color="#B05020", alpha=0.7, zorder=3)
-            ax.add_patch(circ)
-            ax.text(ox, oy + OBS_RADIUS + 0.01, "obs",
-                    color="#B05020", fontsize=5, ha="center", va="bottom")
+            cx3 = ox + OBS_RADIUS * CYL_COS
+            cy3 = oy + OBS_RADIUS * CYL_SIN
+            ax3d.plot_surface(cx3, cy3, _CZ,
+                              color="#B05020", alpha=0.85,
+                              rstride=1, cstride=1, linewidth=0)
 
-        # Wind direction arrow (at top-left of arena)
-        wscale = 0.08
-        ax.annotate("",
-            xy=(x_min + 0.12 + WIND_DIR_XY[0] * wscale,
-                y_max - 0.08 + WIND_DIR_XY[1] * wscale),
-            xytext=(x_min + 0.12, y_max - 0.08),
-            arrowprops=dict(arrowstyle="->", color="#88CCFF", lw=1.5))
-        ax.text(x_min + 0.12, y_max - 0.04, "wind",
-                color="#88CCFF", fontsize=6, ha="center")
+        # Odor source
+        ax3d.scatter(*ODOR_SOURCE, marker="*", s=120, color="#FFD700", zorder=6)
+        ax3d.text(0.0, 0.0, 0.005, "source", color="#FFD700", fontsize=5)
 
-        # Full trail (grey)
-        ax.plot(x[:fi+1], y[:fi+1], color="#444", lw=0.5, alpha=0.5)
+        # Wind arrows
+        ax3d.quiver(WX, WY, WZ, WU, WV, WW,
+                    color="#88CCFF", linewidth=0.8, alpha=0.65,
+                    arrow_length_ratio=0.35)
 
-        # Recent trail coloured by mode
-        start = max(0, fi - trail_steps)
-        for t in range(start, fi):
+        # Full trajectory (faded)
+        ax3d.plot(x[:fi + 1], y[:fi + 1], np.full(fi + 1, 0.001),
+                  color="#444", lw=0.5, alpha=0.4)
+
+        # Recent trajectory coloured by mode
+        t_start_trail = max(0, fi - trail_steps)
+        for t in range(t_start_trail, fi):
             col = MODE_COLORS.get(int(modes[t]), "white")
-            ax.plot(x[t:t+2], y[t:t+2], color=col, lw=1.5, alpha=0.8)
+            ax3d.plot(x[t:t + 2], y[t:t + 2], [0.001, 0.001],
+                      color=col, lw=2.0, alpha=0.85)
 
-        # Current position + heading arrow
-        ax.scatter(x[fi], y[fi], color="white", s=40, zorder=5)
-        arrow_len = 0.015
-        ax.annotate("",
-            xy=(x[fi] + arrow_len * np.cos(theta[fi]),
-                y[fi] + arrow_len * np.sin(theta[fi])),
-            xytext=(x[fi], y[fi]),
-            arrowprops=dict(arrowstyle="->", color="white", lw=1.5))
+        # ── Fly body at current frame ──────────────────────────────────
+        cx_fly = float(x[fi])
+        cy_fly = float(y[fi])
+        cth    = float(np.cos(theta[fi]))
+        sth    = float(np.sin(theta[fi]))
 
-        # Odor source / food target at origin
-        ax.scatter(*ODOR_SOURCE_XY, marker="*", color="#FFD700", s=250,
-                   zorder=6, label="odor source / food")
-        ax.text(ODOR_SOURCE_XY[0], ODOR_SOURCE_XY[1] + 0.025,
-                "source", color="#FFD700", fontsize=6, ha="center")
+        # Thorax (large dot)
+        ax3d.scatter([cx_fly], [cy_fly], [0.004],
+                     s=90, c="#E8E8E8", zorder=8, depthshade=False)
+        # Head (small dot, offset forward)
+        hx = cx_fly + FLY_BODY_LEN * 0.85 * cth
+        hy = cy_fly + FLY_BODY_LEN * 0.85 * sth
+        ax3d.scatter([hx], [hy], [0.005],
+                     s=30, c="#DDDDDD", zorder=8, depthshade=False)
+        # Wings (line perpendicular to body axis, at thorax)
+        wx1 = cx_fly - sth * FLY_WING_SPAN
+        wy1 = cy_fly + cth * FLY_WING_SPAN
+        wx2 = cx_fly + sth * FLY_WING_SPAN
+        wy2 = cy_fly - cth * FLY_WING_SPAN
+        ax3d.plot([wx1, wx2], [wy1, wy2], [0.004, 0.004],
+                  color="#AADDFF", lw=1.5, alpha=0.9, zorder=8)
+        # Heading arrow (red)
+        ax3d.quiver(cx_fly, cy_fly, 0.006,
+                    cth * 0.028, sth * 0.028, 0.0,
+                    color="#FF4444", linewidth=1.8,
+                    arrow_length_ratio=0.4, zorder=9)
 
+        # ────────────────────────────────────────────────────────────────
+        # RIGHT TOP — 2D top-down view
+        # ────────────────────────────────────────────────────────────────
+        ax2d = fig.add_subplot(gs[0, 1])
+        ax2d.set_facecolor("#1a1a2e")
+        ax2d.set_aspect("equal", adjustable="datalim")
+        ax2d.tick_params(colors="white", labelsize=6)
+        for sp in ax2d.spines.values():
+            sp.set_edgecolor("#334466")
+
+        # Obstacles
+        for ox, oy in OBSTACLES_XY:
+            ax2d.add_patch(plt.Circle((ox, oy), OBS_RADIUS,
+                                      color="#B05020", alpha=0.7, zorder=3))
+
+        # Wind arrow (top-left of panel)
+        x2_lo = min(float(x.min()) - 0.04, -0.15)
+        x2_hi = max(float(x.max()) + 0.04,  0.08)
+        y2_lo = min(float(y.min()) - 0.04, -0.08)
+        y2_hi = max(float(y.max()) + 0.04,  0.08)
+        ax2d.set_xlim(x2_lo, x2_hi)
+        ax2d.set_ylim(y2_lo, y2_hi)
+        wscale = 0.07
+        ax2d.annotate("",
+            xy=(x2_lo + 0.07 + (-0.2) * wscale, y2_hi - 0.05),
+            xytext=(x2_lo + 0.07, y2_hi - 0.05),
+            arrowprops=dict(arrowstyle="->", color="#88CCFF", lw=1.2))
+        ax2d.text(x2_lo + 0.07, y2_hi - 0.02, "wind",
+                  color="#88CCFF", fontsize=5, ha="center")
+
+        # Plume footprint (triangle on floor)
+        d_max_2d = 0.75
+        r_max_2d = d_max_2d * np.tan(np.radians(18))
+        cone2d_x = np.concatenate([[0.0],
+                                    np.linspace(0, -d_max_2d, 20),
+                                    np.linspace(-d_max_2d, 0, 20)])
+        cone2d_y = np.concatenate([[0.0],
+                                    np.linspace(0, r_max_2d, 20),
+                                    np.linspace(-r_max_2d, 0, 20)])
+        ax2d.fill(cone2d_x, cone2d_y, color="#FFD700", alpha=0.08, zorder=1)
+
+        # Full trajectory (grey)
+        ax2d.plot(x[:fi + 1], y[:fi + 1], color="#444", lw=0.5, alpha=0.5)
+        # Recent trajectory coloured by mode
+        for t in range(t_start_trail, fi):
+            ax2d.plot(x[t:t + 2], y[t:t + 2],
+                      color=MODE_COLORS.get(int(modes[t]), "white"),
+                      lw=1.5, alpha=0.8)
+        # Fly position + heading
+        ax2d.scatter(cx_fly, cy_fly, color="white", s=25, zorder=5)
+        ax2d.annotate("",
+            xy=(cx_fly + 0.014 * cth, cy_fly + 0.014 * sth),
+            xytext=(cx_fly, cy_fly),
+            arrowprops=dict(arrowstyle="->", color="#FF4444", lw=1.2))
+        # Wings in 2D
+        ax2d.plot([cx_fly - sth * FLY_WING_SPAN, cx_fly + sth * FLY_WING_SPAN],
+                  [cy_fly + cth * FLY_WING_SPAN, cy_fly - cth * FLY_WING_SPAN],
+                  color="#AADDFF", lw=1.2, alpha=0.85)
+        # Odor source
+        ax2d.scatter(0.0, 0.0, marker="*", color="#FFD700", s=180, zorder=6)
         # Mode legend
         patches = [mpatches.Patch(color=v, label=k)
                    for k, v in zip(MODE_NAMES.values(), MODE_COLORS.values())]
-        ax.legend(handles=patches, loc="upper right",
-                  fontsize=7, facecolor="#1a1a2e", labelcolor="white")
+        ax2d.legend(handles=patches, loc="upper right",
+                    fontsize=5, facecolor="#1a1a2e", labelcolor="white",
+                    borderpad=0.4, handlelength=1.0)
 
-        # Info text
+        # ────────────────────────────────────────────────────────────────
+        # RIGHT BOTTOM — log-likelihood timeline
+        # ────────────────────────────────────────────────────────────────
+        ax_lik = fig.add_subplot(gs[1, 1])
+        ax_lik.set_facecolor("#1a1a2e")
+        ax_lik.tick_params(colors="white", labelsize=5)
+        for sp in ax_lik.spines.values():
+            sp.set_edgecolor("#334466")
+        t_axis = np.arange(fi + 1) * 20   # ms
+        ax_lik.plot(t_axis, liks[:fi + 1], color="#44FF88", lw=0.9, alpha=0.85)
+        ax_lik.axvline(fi * 20, color="white", lw=0.6, ls="--", alpha=0.5)
+        ax_lik.set_xlim(0, T * 20)
+        ax_lik.set_xlabel("t (ms)", color="white", fontsize=5)
+        ax_lik.set_ylabel("log lik", color="white", fontsize=5)
+
+        # ── Shared title ───────────────────────────────────────────────
         t_ms_now = fi * 20
-        d_src = np.hypot(x[fi] - ODOR_SOURCE_XY[0], y[fi] - ODOR_SOURCE_XY[1])
-        ax.set_title(
-            f"t = {t_ms_now:,} ms  |  mode = {MODE_NAMES.get(int(modes[fi]), '?')}  "
-            f"|  d_source = {d_src*100:.1f} cm",
-            color="white", fontsize=9
+        d_src = float(np.hypot(cx_fly, cy_fly))
+        mode_name = MODE_NAMES.get(int(modes[fi]), "?") if fi < len(modes) else "?"
+        fig.suptitle(
+            f"t = {t_ms_now:,} ms  |  mode = {mode_name}  "
+            f"|  d_source = {d_src * 100:.1f} cm",
+            color="white", fontsize=8, y=0.99,
         )
 
         fig.canvas.draw()
-        frame = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8)
+        buf = fig.canvas.buffer_rgba()
+        frame = np.frombuffer(buf, dtype=np.uint8).copy()
         frame = frame.reshape(fig.canvas.get_width_height()[::-1] + (4,))[:, :, :3]
         frames.append(frame)
         plt.close(fig)
 
+        if (fi_idx + 1) % 25 == 0 or fi_idx == n_frames - 1:
+            print(f"  Rendered {fi_idx + 1}/{n_frames} frames ...")
+
     print(f"Saving {len(frames)} frames to {video_path} at {fps} fps ...")
-    mediapy.write_video(video_path, frames, fps=fps)
+    try:
+        import mediapy
+        mediapy.write_video(video_path, frames, fps=fps)
+    except ImportError:
+        # Fallback: opencv-python-headless (no display needed)
+        import cv2
+        h_px, w_px = frames[0].shape[:2]
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        out = cv2.VideoWriter(video_path, fourcc, fps, (w_px, h_px))
+        for fr in frames:
+            out.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))
+        out.release()
     print(f"Video saved: {video_path}")
 
 
